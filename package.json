@@ -1,0 +1,43 @@
+{
+  "name": "sql-server-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for SQL Server with Windows and Entra ID authentication support",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "sql-server-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "inspect": "npx @modelcontextprotocol/inspector dist/index.js"
+  },
+  "keywords": [
+    "mcp",
+    "sql-server",
+    "sqlserver",
+    "mssql",
+    "windows-authentication",
+    "entra-id",
+    "azure-ad"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "dotenv": "^16.4.7",
+    "mssql": "^12.2.0",
+    "tedious": "^19.0.0",
+    "zod": "^3.25.1"
+  },
+  "devDependencies": {
+    "@types/mssql": "^9.1.5",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<evaluation>
+  <description>
+    Evaluation questions for SQL Server MCP Server.
+    These questions test the ability to discover schema, query data, and navigate
+    database structures using the SQL Server MCP tools.
+
+    Prerequisites:
+    - SQL Server instance with AdventureWorks or similar sample database
+    - Connection configured via environment variables
+    - Read-only access sufficient for all questions
+  </description>
+
+  <qa_pair>
+    <question>
+      Connect to the SQL Server and list all databases. What is the name of the system database that contains metadata about all other databases on the server instance?
+    </question>
+    <answer>master</answer>
+  </qa_pair>
+
+  <qa_pair>
+    <question>
+      Find all tables in the 'dbo' schema. How many user tables exist in this schema? (Provide only the number)
+    </question>
+    <answer>Varies by database - requires actual testing</answer>
+    <note>This question needs to be adjusted based on actual database schema</note>
+  </qa_pair>
+
+  <qa_pair>
+    <question>
+      Get detailed information about the 'sys.databases' system view including its columns. What is the data type of the 'name' column?
+    </question>
+    <answer>sysname</answer>
+  </qa_pair>
+
+  <qa_pair>
+    <question>
+      Query the SQL Server version information. What is the major version number of the SQL Server instance? (e.g., for SQL Server 2019, answer is 15; for SQL Server 2022, answer is 16)
+    </question>
+    <answer>Varies by installation</answer>
+    <note>This question needs actual server version to provide correct answer</note>
+  </qa_pair>
+
+  <qa_pair>
+    <question>
+      List all stored procedures in the 'dbo' schema. Are there more than 5 stored procedures in this schema? (Answer 'yes' or 'no')
+    </question>
+    <answer>Varies by database</answer>
+    <note>This question needs to be adjusted based on actual database schema</note>
+  </qa_pair>
+
+  <qa_pair>
+    <question>
+      Get the server information and determine if HADR (High Availability Disaster Recovery) / Always On Availability Groups is enabled on this SQL Server instance. (Answer 'true' or 'false')
+    </question>
+    <answer>Varies by configuration</answer>
+    <note>This question needs actual server configuration</note>
+  </qa_pair>
+
+  <qa_pair>
+    <question>
+      Query sys.dm_exec_sessions to find the total number of active user sessions currently connected to the SQL Server. Is the number greater than 0? (Answer 'yes' or 'no')
+    </question>
+    <answer>yes</answer>
+  </qa_pair>
+
+  <qa_pair>
+    <question>
+      Get the current database size information. What is the unit used for reporting the database size in the tool's response? (Answer: 'KB', 'MB', 'GB', or 'bytes')
+    </question>
+    <answer>MB</answer>
+  </qa_pair>
+
+  <qa_pair>
+    <question>
+      Test the connection to SQL Server and extract the SQL Server edition from the version string. Is it 'Express', 'Standard', 'Enterprise', or 'Developer'?
+    </question>
+    <answer>Varies by installation</answer>
+    <note>This question needs actual server edition</note>
+  </qa_pair>
+
+  <qa_pair>
+    <question>
+      Query sys.databases with a filter to find only ONLINE databases. Use the sqlserver_execute_query tool with proper pagination (limit 10). How many columns are returned in each row?
+    </question>
+    <answer>6</answer>
+    <note>Based on the implementation in listDatabasesTool which selects: name, database_id, create_date, state_desc, recovery_model_desc, compatibility_level</note>
+  </qa_pair>
+
+  <note>
+    These evaluation questions should be refined based on the specific test environment.
+    Many answers depend on the actual database schema and configuration.
+    For production evaluations, use a standardized test database like AdventureWorks
+    with known schema and data to enable deterministic answers.
+  </note>
+</evaluation>
