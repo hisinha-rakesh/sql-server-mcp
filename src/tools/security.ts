@@ -1774,3 +1774,499 @@ export const exportLoginTool = {
     }
   },
 };
+
+/**
+ * Get Permissions Tool
+ * Based on dbatools Get-DbaPermission functionality
+ * Retrieves permissions for logins and database users
+ */
+const getPermissionsInputSchema = z.object({
+  database: z.string().optional().describe('Specific database to check permissions. If not specified, shows server-level permissions.'),
+  principal: z.string().optional().describe('Specific login or user name to filter permissions. If not specified, shows all permissions.'),
+  includeServerPermissions: z.boolean().default(true).describe('Include server-level permissions in results'),
+  includeDatabasePermissions: z.boolean().default(true).describe('Include database-level permissions in results'),
+  includeObjectPermissions: z.boolean().default(false).describe('Include object-level permissions (can be verbose)'),
+});
+
+export const getPermissionsTool = {
+  name: 'sqlserver_get_permissions',
+  description: 'Retrieve detailed permission information for logins and database users at server, database, and object levels. Shows effective permissions including those inherited from roles. Based on dbatools Get-DbaPermission functionality.',
+  inputSchema: getPermissionsInputSchema,
+  annotations: {
+    readOnlyHint: true,
+  },
+  handler: async (connectionManager: ConnectionManager, input: z.infer<typeof getPermissionsInputSchema>) => {
+    try {
+      const { database, principal, includeServerPermissions, includeDatabasePermissions, includeObjectPermissions } = input;
+
+      let allResults: any[] = [];
+
+      // Get server-level permissions
+      if (includeServerPermissions && !database) {
+        let serverQuery = `
+          SELECT
+            'SERVER' AS PermissionLevel,
+            sp.name AS PrincipalName,
+            sp.type_desc AS PrincipalType,
+            perm.state_desc AS PermissionState,
+            perm.permission_name AS PermissionName,
+            'SERVER' AS ObjectType,
+            'SERVER' AS ObjectName,
+            '' AS SchemaName
+          FROM sys.server_permissions perm
+          INNER JOIN sys.server_principals sp ON perm.grantee_principal_id = sp.principal_id
+          WHERE perm.class = 100
+        `;
+
+        if (principal) {
+          serverQuery += ` AND sp.name = '${principal.replace(/'/g, "''")}'`;
+        }
+
+        serverQuery += ` ORDER BY sp.name, perm.permission_name`;
+
+        const serverResult = await connectionManager.executeQuery(serverQuery);
+        allResults = allResults.concat(serverResult.recordset);
+      }
+
+      // Get database-level permissions
+      if (includeDatabasePermissions) {
+        const targetDatabase = database || (await connectionManager.executeQuery('SELECT DB_NAME() AS CurrentDB')).recordset[0].CurrentDB;
+
+        let dbQuery = `
+          USE [${targetDatabase.replace(/'/g, "''")}];
+          SELECT
+            'DATABASE' AS PermissionLevel,
+            dp.name AS PrincipalName,
+            dp.type_desc AS PrincipalType,
+            perm.state_desc AS PermissionState,
+            perm.permission_name AS PermissionName,
+            perm.class_desc AS ObjectType,
+            CASE
+              WHEN perm.class = 0 THEN '${targetDatabase}'
+              WHEN perm.class = 1 THEN OBJECT_NAME(perm.major_id)
+              WHEN perm.class = 3 THEN SCHEMA_NAME(perm.major_id)
+              ELSE CAST(perm.major_id AS VARCHAR)
+            END AS ObjectName,
+            CASE
+              WHEN perm.class = 1 THEN OBJECT_SCHEMA_NAME(perm.major_id)
+              ELSE ''
+            END AS SchemaName
+          FROM sys.database_permissions perm
+          INNER JOIN sys.database_principals dp ON perm.grantee_principal_id = dp.principal_id
+          WHERE dp.name NOT IN ('public', 'guest')
+        `;
+
+        if (principal) {
+          dbQuery += ` AND dp.name = '${principal.replace(/'/g, "''")}'`;
+        }
+
+        if (!includeObjectPermissions) {
+          dbQuery += ` AND perm.class IN (0, 3)`; // Database and schema level only
+        }
+
+        dbQuery += ` ORDER BY dp.name, perm.permission_name`;
+
+        const dbResult = await connectionManager.executeQuery(dbQuery);
+        allResults = allResults.concat(dbResult.recordset);
+      }
+
+      if (allResults.length === 0) {
+        return {
+          content: [{
+            type: 'text' as const,
+            text: '⚠️  No permissions found matching the specified criteria.',
+          }],
+        };
+      }
+
+      let response = `Permissions (${allResults.length}):\n\n`;
+      response += formatResultsAsTable(allResults);
+
+      // Add summary by principal
+      const principalSummary = allResults.reduce((acc: any, perm: any) => {
+        const key = perm.PrincipalName;
+        if (!acc[key]) {
+          acc[key] = { name: key, type: perm.PrincipalType, count: 0 };
+        }
+        acc[key].count++;
+        return acc;
+      }, {});
+
+      const summaryArray = Object.values(principalSummary);
+      response += `\n\nSummary by Principal:\n`;
+      response += formatResultsAsTable(summaryArray.map((s: any) => ({
+        Principal: s.name,
+        Type: s.type,
+        PermissionCount: s.count,
+      })));
+
+      return {
+        content: [{
+          type: 'text' as const,
+          text: response,
+        }],
+      };
+
+    } catch (error) {
+      return {
+        content: [{
+          type: 'text' as const,
+          text: formatError(error),
+        }],
+        isError: true,
+      };
+    }
+  },
+};
+
+/**
+ * Grant Permission Tool
+ * Based on dbatools Grant-DbaAgPermission functionality
+ * Grants permissions to logins or database users
+ */
+const grantPermissionInputSchema = z.object({
+  principal: z.union([z.string(), z.array(z.string())]).describe('Login or user name(s) to grant permission to'),
+  permission: z.union([z.string(), z.array(z.string())]).describe('Permission(s) to grant (e.g., SELECT, INSERT, UPDATE, CONTROL SERVER, VIEW SERVER STATE)'),
+  database: z.string().optional().describe('Database name for database-level permissions. If not specified, grants server-level permission.'),
+  schema: z.string().optional().describe('Schema name for schema-level permissions'),
+  objectName: z.string().optional().describe('Object name (table, view, stored procedure) for object-level permissions'),
+  objectType: z.enum(['TABLE', 'VIEW', 'PROCEDURE', 'FUNCTION', 'SCHEMA']).optional().describe('Type of database object'),
+  withGrantOption: z.boolean().default(false).describe('Allow the principal to grant this permission to others'),
+});
+
+export const grantPermissionTool = {
+  name: 'sqlserver_grant_permission',
+  description: 'Grant permissions to SQL Server logins or database users at server, database, schema, or object level. Supports WITH GRANT OPTION for delegation. Based on dbatools Grant-DbaAgPermission functionality.',
+  inputSchema: grantPermissionInputSchema,
+  annotations: {
+    readOnlyHint: false,
+  },
+  handler: async (connectionManager: ConnectionManager, input: z.infer<typeof grantPermissionInputSchema>) => {
+    try {
+      const { principal, permission, database, schema, objectName, objectType, withGrantOption } = input;
+
+      const principals = Array.isArray(principal) ? principal : [principal];
+      const permissions = Array.isArray(permission) ? permission : [permission];
+
+      const results: Array<{
+        Principal: string;
+        Permission: string;
+        Scope: string;
+        Status: string;
+        Message: string;
+      }> = [];
+
+      for (const principalName of principals) {
+        for (const permName of permissions) {
+          try {
+            let grantQuery = '';
+            let scope = '';
+
+            if (objectName && database) {
+              // Object-level permission
+              const objectTypeStr = objectType || 'TABLE';
+              const schemaPrefix = schema ? `[${schema.replace(/'/g, "''")}].` : 'dbo.';
+              grantQuery = `USE [${database.replace(/'/g, "''")}]; GRANT ${permName} ON ${objectTypeStr}::${schemaPrefix}[${objectName.replace(/'/g, "''")}] TO [${principalName.replace(/'/g, "''")}]`;
+              scope = `${database}.${schemaPrefix}${objectName}`;
+            } else if (schema && database) {
+              // Schema-level permission
+              grantQuery = `USE [${database.replace(/'/g, "''")}]; GRANT ${permName} ON SCHEMA::[${schema.replace(/'/g, "''")}] TO [${principalName.replace(/'/g, "''")}]`;
+              scope = `${database}.${schema}`;
+            } else if (database) {
+              // Database-level permission
+              grantQuery = `USE [${database.replace(/'/g, "''")}]; GRANT ${permName} TO [${principalName.replace(/'/g, "''")}]`;
+              scope = `Database: ${database}`;
+            } else {
+              // Server-level permission
+              grantQuery = `GRANT ${permName} TO [${principalName.replace(/'/g, "''")}]`;
+              scope = 'Server';
+            }
+
+            if (withGrantOption) {
+              grantQuery += ' WITH GRANT OPTION';
+            }
+
+            await connectionManager.executeQuery(grantQuery);
+
+            results.push({
+              Principal: principalName,
+              Permission: permName,
+              Scope: scope,
+              Status: 'SUCCESS',
+              Message: 'Permission granted successfully',
+            });
+
+          } catch (error) {
+            results.push({
+              Principal: principalName,
+              Permission: permName,
+              Scope: database || 'Server',
+              Status: 'FAILED',
+              Message: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
+      }
+
+      const successCount = results.filter(r => r.Status === 'SUCCESS').length;
+      const failedCount = results.filter(r => r.Status === 'FAILED').length;
+
+      let response = `Grant Permission Results:\n\n`;
+      response += `Total: ${results.length}, Success: ${successCount}, Failed: ${failedCount}\n\n`;
+      response += formatResultsAsTable(results);
+
+      return {
+        content: [{
+          type: 'text' as const,
+          text: response,
+        }],
+        isError: failedCount > 0,
+      };
+
+    } catch (error) {
+      return {
+        content: [{
+          type: 'text' as const,
+          text: formatError(error),
+        }],
+        isError: true,
+      };
+    }
+  },
+};
+
+/**
+ * Revoke Permission Tool
+ * Based on dbatools Revoke-DbaAgPermission functionality
+ * Revokes permissions from logins or database users
+ */
+const revokePermissionInputSchema = z.object({
+  principal: z.union([z.string(), z.array(z.string())]).describe('Login or user name(s) to revoke permission from'),
+  permission: z.union([z.string(), z.array(z.string())]).describe('Permission(s) to revoke'),
+  database: z.string().optional().describe('Database name for database-level permissions. If not specified, revokes server-level permission.'),
+  schema: z.string().optional().describe('Schema name for schema-level permissions'),
+  objectName: z.string().optional().describe('Object name for object-level permissions'),
+  objectType: z.enum(['TABLE', 'VIEW', 'PROCEDURE', 'FUNCTION', 'SCHEMA']).optional().describe('Type of database object'),
+  cascade: z.boolean().default(false).describe('Also revoke from principals who received permission through GRANT OPTION'),
+});
+
+export const revokePermissionTool = {
+  name: 'sqlserver_revoke_permission',
+  description: 'Revoke permissions from SQL Server logins or database users. Supports CASCADE option to remove permissions that were granted by the principal. Based on dbatools Revoke-DbaAgPermission functionality.',
+  inputSchema: revokePermissionInputSchema,
+  annotations: {
+    readOnlyHint: false,
+  },
+  handler: async (connectionManager: ConnectionManager, input: z.infer<typeof revokePermissionInputSchema>) => {
+    try {
+      const { principal, permission, database, schema, objectName, objectType, cascade } = input;
+
+      const principals = Array.isArray(principal) ? principal : [principal];
+      const permissions = Array.isArray(permission) ? permission : [permission];
+
+      const results: Array<{
+        Principal: string;
+        Permission: string;
+        Scope: string;
+        Status: string;
+        Message: string;
+      }> = [];
+
+      for (const principalName of principals) {
+        for (const permName of permissions) {
+          try {
+            let revokeQuery = '';
+            let scope = '';
+
+            if (objectName && database) {
+              // Object-level permission
+              const objectTypeStr = objectType || 'TABLE';
+              const schemaPrefix = schema ? `[${schema.replace(/'/g, "''")}].` : 'dbo.';
+              revokeQuery = `USE [${database.replace(/'/g, "''")}]; REVOKE ${permName} ON ${objectTypeStr}::${schemaPrefix}[${objectName.replace(/'/g, "''")}] FROM [${principalName.replace(/'/g, "''")}]`;
+              scope = `${database}.${schemaPrefix}${objectName}`;
+            } else if (schema && database) {
+              // Schema-level permission
+              revokeQuery = `USE [${database.replace(/'/g, "''")}]; REVOKE ${permName} ON SCHEMA::[${schema.replace(/'/g, "''")}] FROM [${principalName.replace(/'/g, "''")}]`;
+              scope = `${database}.${schema}`;
+            } else if (database) {
+              // Database-level permission
+              revokeQuery = `USE [${database.replace(/'/g, "''")}]; REVOKE ${permName} FROM [${principalName.replace(/'/g, "''")}]`;
+              scope = `Database: ${database}`;
+            } else {
+              // Server-level permission
+              revokeQuery = `REVOKE ${permName} FROM [${principalName.replace(/'/g, "''")}]`;
+              scope = 'Server';
+            }
+
+            if (cascade) {
+              revokeQuery += ' CASCADE';
+            }
+
+            await connectionManager.executeQuery(revokeQuery);
+
+            results.push({
+              Principal: principalName,
+              Permission: permName,
+              Scope: scope,
+              Status: 'SUCCESS',
+              Message: 'Permission revoked successfully',
+            });
+
+          } catch (error) {
+            results.push({
+              Principal: principalName,
+              Permission: permName,
+              Scope: database || 'Server',
+              Status: 'FAILED',
+              Message: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
+      }
+
+      const successCount = results.filter(r => r.Status === 'SUCCESS').length;
+      const failedCount = results.filter(r => r.Status === 'FAILED').length;
+
+      let response = `Revoke Permission Results:\n\n`;
+      response += `Total: ${results.length}, Success: ${successCount}, Failed: ${failedCount}\n\n`;
+      response += formatResultsAsTable(results);
+
+      return {
+        content: [{
+          type: 'text' as const,
+          text: response,
+        }],
+        isError: failedCount > 0,
+      };
+
+    } catch (error) {
+      return {
+        content: [{
+          type: 'text' as const,
+          text: formatError(error),
+        }],
+        isError: true,
+      };
+    }
+  },
+};
+
+/**
+ * Deny Permission Tool
+ * Explicitly denies permissions to logins or database users
+ */
+const denyPermissionInputSchema = z.object({
+  principal: z.union([z.string(), z.array(z.string())]).describe('Login or user name(s) to deny permission to'),
+  permission: z.union([z.string(), z.array(z.string())]).describe('Permission(s) to deny'),
+  database: z.string().optional().describe('Database name for database-level permissions. If not specified, denies server-level permission.'),
+  schema: z.string().optional().describe('Schema name for schema-level permissions'),
+  objectName: z.string().optional().describe('Object name for object-level permissions'),
+  objectType: z.enum(['TABLE', 'VIEW', 'PROCEDURE', 'FUNCTION', 'SCHEMA']).optional().describe('Type of database object'),
+  cascade: z.boolean().default(false).describe('Also deny to principals who received permission through GRANT OPTION'),
+});
+
+export const denyPermissionTool = {
+  name: 'sqlserver_deny_permission',
+  description: 'Explicitly deny permissions to SQL Server logins or database users. DENY takes precedence over GRANT, preventing access even if granted through role membership. Use carefully as it overrides all grants.',
+  inputSchema: denyPermissionInputSchema,
+  annotations: {
+    readOnlyHint: false,
+  },
+  handler: async (connectionManager: ConnectionManager, input: z.infer<typeof denyPermissionInputSchema>) => {
+    try {
+      const { principal, permission, database, schema, objectName, objectType, cascade } = input;
+
+      const principals = Array.isArray(principal) ? principal : [principal];
+      const permissions = Array.isArray(permission) ? permission : [permission];
+
+      const results: Array<{
+        Principal: string;
+        Permission: string;
+        Scope: string;
+        Status: string;
+        Message: string;
+      }> = [];
+
+      for (const principalName of principals) {
+        for (const permName of permissions) {
+          try {
+            let denyQuery = '';
+            let scope = '';
+
+            if (objectName && database) {
+              // Object-level permission
+              const objectTypeStr = objectType || 'TABLE';
+              const schemaPrefix = schema ? `[${schema.replace(/'/g, "''")}].` : 'dbo.';
+              denyQuery = `USE [${database.replace(/'/g, "''")}]; DENY ${permName} ON ${objectTypeStr}::${schemaPrefix}[${objectName.replace(/'/g, "''")}] TO [${principalName.replace(/'/g, "''")}]`;
+              scope = `${database}.${schemaPrefix}${objectName}`;
+            } else if (schema && database) {
+              // Schema-level permission
+              denyQuery = `USE [${database.replace(/'/g, "''")}]; DENY ${permName} ON SCHEMA::[${schema.replace(/'/g, "''")}] TO [${principalName.replace(/'/g, "''")}]`;
+              scope = `${database}.${schema}`;
+            } else if (database) {
+              // Database-level permission
+              denyQuery = `USE [${database.replace(/'/g, "''")}]; DENY ${permName} TO [${principalName.replace(/'/g, "''")}]`;
+              scope = `Database: ${database}`;
+            } else {
+              // Server-level permission
+              denyQuery = `DENY ${permName} TO [${principalName.replace(/'/g, "''")}]`;
+              scope = 'Server';
+            }
+
+            if (cascade) {
+              denyQuery += ' CASCADE';
+            }
+
+            await connectionManager.executeQuery(denyQuery);
+
+            results.push({
+              Principal: principalName,
+              Permission: permName,
+              Scope: scope,
+              Status: 'SUCCESS',
+              Message: 'Permission denied successfully',
+            });
+
+          } catch (error) {
+            results.push({
+              Principal: principalName,
+              Permission: permName,
+              Scope: database || 'Server',
+              Status: 'FAILED',
+              Message: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
+      }
+
+      const successCount = results.filter(r => r.Status === 'SUCCESS').length;
+      const failedCount = results.filter(r => r.Status === 'FAILED').length;
+
+      let response = `Deny Permission Results:\n\n`;
+      response += `Total: ${results.length}, Success: ${successCount}, Failed: ${failedCount}\n\n`;
+      response += formatResultsAsTable(results);
+
+      if (successCount > 0) {
+        response += `\n⚠️  Warning: DENY takes precedence over GRANT. These principals cannot access the resource even if granted through role membership.`;
+      }
+
+      return {
+        content: [{
+          type: 'text' as const,
+          text: response,
+        }],
+        isError: failedCount > 0,
+      };
+
+    } catch (error) {
+      return {
+        content: [{
+          type: 'text' as const,
+          text: formatError(error),
+        }],
+        isError: true,
+      };
+    }
+  },
+};
+

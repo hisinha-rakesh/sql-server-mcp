@@ -107,6 +107,10 @@ import {
   testWindowsLoginTool,
   findLoginInGroupTool,
   exportLoginTool,
+  getPermissionsTool,
+  grantPermissionTool,
+  revokePermissionTool,
+  denyPermissionTool,
 } from './tools/security.js';
 
 
@@ -234,6 +238,12 @@ const tools = [
   testWindowsLoginTool,
   findLoginInGroupTool,
   exportLoginTool,
+
+  // Permission management tools
+  getPermissionsTool,
+  grantPermissionTool,
+  revokePermissionTool,
+  denyPermissionTool,
 ];
 
 // Register tool list handler
@@ -298,6 +308,13 @@ const writeOperations = new Set([
   'sqlserver_remove_server_role_member',
   'sqlserver_create_server_role',
   'sqlserver_drop_server_role',
+  'sqlserver_new_login',
+  'sqlserver_remove_login',
+  'sqlserver_set_login',
+  'sqlserver_rename_login',
+  'sqlserver_grant_permission',
+  'sqlserver_revoke_permission',
+  'sqlserver_deny_permission',
 ]);
 
 // Register tool call handler
