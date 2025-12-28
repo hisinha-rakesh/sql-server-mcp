@@ -433,3 +433,339 @@ This is essential for diagnosing performance issues and understanding where SQL 
     }
   },
 };
+// THIS FILE CONTAINS 12 NEW PERFORMANCE TOOLS TO BE APPENDED TO performance.ts
+
+// ==================== MEMORY MANAGEMENT TOOLS (6) ====================
+
+const getMemoryUsageInputSchema = z.object({});
+
+export const getMemoryUsageTool = {
+  name: 'sqlserver_get_memory_usage',
+  description: `Get SQL Server memory usage statistics. Shows process memory, system memory, and top memory clerks. Based on dbatools Get-DbaMemoryUsage.`,
+  inputSchema: getMemoryUsageInputSchema,
+  annotations: { readOnlyHint: true },
+  handler: async (connectionManager: ConnectionManager, input: z.infer<typeof getMemoryUsageInputSchema>) => {
+    try {
+      const query = `
+        SELECT (physical_memory_in_use_kb/1024) AS physical_memory_in_use_mb, (locked_page_allocations_kb/1024) AS locked_page_allocations_mb,
+        (virtual_address_space_committed_kb/1024) AS virtual_address_space_committed_mb, memory_utilization_percentage FROM sys.dm_os_process_memory;
+        SELECT (total_physical_memory_kb/1024) AS total_physical_memory_mb, (available_physical_memory_kb/1024) AS available_physical_memory_mb,
+        system_memory_state_desc FROM sys.dm_os_sys_memory;
+        SELECT TOP 10 type AS memory_clerk_type, (SUM(pages_kb)/1024) AS memory_used_mb FROM sys.dm_os_memory_clerks GROUP BY type ORDER BY SUM(pages_kb) DESC;
+      `;
+      const result = await connectionManager.executeQuery(query, {});
+      const recordsets = result.recordsets as any[];
+      let response = 'SQL Server Memory Usage:\n\n=== Process Memory ===\n';
+      if (recordsets[0]) response += formatResultsAsTable(recordsets[0]) + '\n';
+      if (recordsets[1]) response += '=== System Memory ===\n' + formatResultsAsTable(recordsets[1]) + '\n';
+      if (recordsets[2]) response += '=== Top 10 Memory Clerks ===\n' + formatResultsAsTable(recordsets[2]);
+      return { content: [{ type: 'text' as const, text: response }] };
+    } catch (error) {
+      return { content: [{ type: 'text' as const, text: formatError(error) }], isError: true };
+    }
+  },
+};
+
+const getDbMemoryUsageInputSchema = z.object({
+  database: z.string().optional().describe('Specific database to analyze'),
+});
+
+export const getDbMemoryUsageTool = {
+  name: 'sqlserver_get_db_memory_usage',
+  description: `Get memory usage by database from buffer pool. Based on dbatools Get-DbaDbMemoryUsage.`,
+  inputSchema: getDbMemoryUsageInputSchema,
+  annotations: { readOnlyHint: true },
+  handler: async (connectionManager: ConnectionManager, input: z.infer<typeof getDbMemoryUsageInputSchema>) => {
+    try {
+      const whereClause = input.database ? 'WHERE DB_NAME(database_id) = @database' : '';
+      const query = `SELECT CASE database_id WHEN 32767 THEN 'ResourceDb' ELSE DB_NAME(database_id) END AS database_name,
+        COUNT(*) AS page_count, (COUNT(*)*8)/1024 AS buffer_pool_mb,
+        SUM(CASE is_modified WHEN 1 THEN 1 ELSE 0 END) AS dirty_pages, SUM(CASE is_modified WHEN 0 THEN 1 ELSE 0 END) AS clean_pages
+        FROM sys.dm_os_buffer_descriptors ${whereClause}
+        GROUP BY database_id ORDER BY buffer_pool_mb DESC;`;
+      const result = await connectionManager.executeQuery(query, input.database ? { database: input.database } : {});
+      if (result.recordset.length === 0) return { content: [{ type: 'text' as const, text: 'No buffer pool data found.' }] };
+      const totalMemory = result.recordset.reduce((sum, row) => sum + (row.buffer_pool_mb || 0), 0);
+      let response = `Database Memory Usage:\n\nTotal: ${totalMemory} MB\nDatabases: ${result.recordset.length}\n\n${formatResultsAsTable(result.recordset)}`;
+      return { content: [{ type: 'text' as const, text: response }] };
+    } catch (error) {
+      return { content: [{ type: 'text' as const, text: formatError(error) }], isError: true };
+    }
+  },
+};
+
+const getMemoryConditionInputSchema = z.object({});
+
+export const getMemoryConditionTool = {
+  name: 'sqlserver_get_memory_condition',
+  description: `Get SQL Server memory condition and pressure indicators from ring buffers. Based on dbatools Get-DbaMemoryCondition.`,
+  inputSchema: getMemoryConditionInputSchema,
+  annotations: { readOnlyHint: true },
+  handler: async (connectionManager: ConnectionManager, input: z.infer<typeof getMemoryConditionInputSchema>) => {
+    try {
+      const query = `SELECT TOP 20 record.value('(Record/@id)[1]', 'int') AS record_id,
+        DATEADD(ms, -1 * ((SELECT ms_ticks FROM sys.dm_os_sys_info) - record.value('(Record/@time)[1]', 'bigint')), GETDATE()) AS event_time,
+        record.value('(Record/ResourceMonitor/Notification)[1]', 'varchar(30)') AS notification
+        FROM (SELECT CAST(record AS xml) AS record FROM sys.dm_os_ring_buffers WHERE ring_buffer_type = 'RING_BUFFER_RESOURCE_MONITOR') AS records
+        ORDER BY event_time DESC;`;
+      const result = await connectionManager.executeQuery(query, {});
+      if (result.recordset.length === 0) return { content: [{ type: 'text' as const, text: 'No memory condition data available.' }] };
+      let response = `Memory Condition (Last 20 events):\n\n${formatResultsAsTable(result.recordset)}\n\nNotifications:\n- RESOURCE_MEMPHYSICAL_LOW: Low physical memory\n- RESOURCE_MEM_STEADY: Memory stable`;
+      return { content: [{ type: 'text' as const, text: response }] };
+    } catch (error) {
+      return { content: [{ type: 'text' as const, text: formatError(error) }], isError: true };
+    }
+  },
+};
+
+const getDbccMemoryStatusInputSchema = z.object({});
+
+export const getDbccMemoryStatusTool = {
+  name: 'sqlserver_get_dbcc_memory_status',
+  description: `Run DBCC MEMORYSTATUS for detailed memory allocation. WARNING: Resource-intensive. Based on dbatools Get-DbaDbccMemoryStatus.`,
+  inputSchema: getDbccMemoryStatusInputSchema,
+  annotations: { readOnlyHint: true },
+  handler: async (connectionManager: ConnectionManager, input: z.infer<typeof getDbccMemoryStatusInputSchema>) => {
+    try {
+      const result = await connectionManager.executeQuery('DBCC MEMORYSTATUS WITH NO_INFOMSGS;', {});
+      const recordsets = result.recordsets as any[];
+      let response = 'DBCC MEMORYSTATUS Output:\n\n';
+      if (recordsets && recordsets.length > 0) {
+        recordsets.forEach((recordset, index) => {
+          if (recordset.length > 0) response += `=== Section ${index + 1} ===\n${formatResultsAsTable(recordset)}\n\n`;
+        });
+      }
+      return { content: [{ type: 'text' as const, text: response }] };
+    } catch (error) {
+      return { content: [{ type: 'text' as const, text: formatError(error) }], isError: true };
+    }
+  },
+};
+
+const getMaxMemoryInputSchema = z.object({});
+
+export const getMaxMemoryTool = {
+  name: 'sqlserver_get_max_memory',
+  description: `Get SQL Server max/min memory configuration. Based on dbatools Get-DbaMaxMemory.`,
+  inputSchema: getMaxMemoryInputSchema,
+  annotations: { readOnlyHint: true },
+  handler: async (connectionManager: ConnectionManager, input: z.infer<typeof getMaxMemoryInputSchema>) => {
+    try {
+      const query = `SELECT name, value AS config_value, value_in_use AS running_value, description FROM sys.configurations
+        WHERE name IN ('max server memory (MB)', 'min server memory (MB)') ORDER BY name;`;
+      const result = await connectionManager.executeQuery(query, {});
+      let response = 'SQL Server Memory Configuration:\n\n' + formatResultsAsTable(result.recordset);
+      const maxMem = result.recordset.find(r => r.name === 'max server memory (MB)');
+      if (maxMem && maxMem.config_value === 2147483647) {
+        response += '\n\n⚠ WARNING: Max memory is default (2147483647 MB). Set to prevent OS instability.';
+      }
+      return { content: [{ type: 'text' as const, text: response }] };
+    } catch (error) {
+      return { content: [{ type: 'text' as const, text: formatError(error) }], isError: true };
+    }
+  },
+};
+
+const setMaxMemoryInputSchema = z.object({
+  maxMemoryMB: z.number().int().min(128).describe('Maximum server memory in MB'),
+  minMemoryMB: z.number().int().min(0).optional().describe('Minimum server memory in MB'),
+});
+
+export const setMaxMemoryTool = {
+  name: 'sqlserver_set_max_memory',
+  description: `Set SQL Server max/min memory. Recommendation: Total RAM - (4GB + 1GB per 8GB RAM). Based on dbatools Set-DbaMaxMemory.`,
+  inputSchema: setMaxMemoryInputSchema,
+  annotations: { readOnlyHint: false },
+  handler: async (connectionManager: ConnectionManager, input: z.infer<typeof setMaxMemoryInputSchema>) => {
+    try {
+      await connectionManager.executeQuery(`EXEC sp_configure 'show advanced options', 1; RECONFIGURE;
+        EXEC sp_configure 'max server memory (MB)', @maxMemoryMB; RECONFIGURE;`, { maxMemoryMB: input.maxMemoryMB });
+      if (input.minMemoryMB !== undefined) {
+        await connectionManager.executeQuery(`EXEC sp_configure 'min server memory (MB)', @minMemoryMB; RECONFIGURE;`, { minMemoryMB: input.minMemoryMB });
+      }
+      const result = await connectionManager.executeQuery(`SELECT name, value_in_use FROM sys.configurations WHERE name IN ('max server memory (MB)', 'min server memory (MB)') ORDER BY name;`, {});
+      let response = `✓ Memory configuration updated\n\n${formatResultsAsTable(result.recordset)}`;
+      return { content: [{ type: 'text' as const, text: response }] };
+    } catch (error) {
+      return { content: [{ type: 'text' as const, text: formatError(error) }], isError: true };
+    }
+  },
+};
+
+// ==================== PLAN CACHE TOOLS (2) ====================
+
+const getPlanCacheInputSchema = z.object({
+  topN: z.number().int().min(1).max(100).optional().describe('Number of top plans to return (default: 20)'),
+});
+
+export const getPlanCacheTool = {
+  name: 'sqlserver_get_plan_cache',
+  description: `Analyze plan cache to identify single-use plans consuming memory. Based on dbatools Get-DbaPlanCache.`,
+  inputSchema: getPlanCacheInputSchema,
+  annotations: { readOnlyHint: true },
+  handler: async (connectionManager: ConnectionManager, input: z.infer<typeof getPlanCacheInputSchema>) => {
+    try {
+      const topN = input.topN ?? 20;
+      const query = `SELECT TOP (@topN) objtype AS plan_type, cacheobjtype AS cache_type, COUNT(*) AS plan_count,
+        SUM(CAST(size_in_bytes AS BIGINT))/1024/1024 AS total_size_mb, AVG(usecounts) AS avg_use_count,
+        SUM(CASE WHEN usecounts=1 THEN 1 ELSE 0 END) AS single_use_plans,
+        SUM(CASE WHEN usecounts=1 THEN CAST(size_in_bytes AS BIGINT) ELSE 0 END)/1024/1024 AS single_use_mb
+        FROM sys.dm_exec_cached_plans GROUP BY objtype, cacheobjtype ORDER BY total_size_mb DESC;`;
+      const result = await connectionManager.executeQuery(query, { topN });
+      const totalCacheMB = result.recordset.reduce((sum, row) => sum + (row.total_size_mb || 0), 0);
+      const totalSingleUseMB = result.recordset.reduce((sum, row) => sum + (row.single_use_mb || 0), 0);
+      let response = `Plan Cache Analysis:\n\nTotal: ${totalCacheMB.toFixed(2)} MB\nSingle-Use: ${totalSingleUseMB.toFixed(2)} MB (${((totalSingleUseMB/totalCacheMB)*100).toFixed(2)}%)\n\n${formatResultsAsTable(result.recordset)}`;
+      return { content: [{ type: 'text' as const, text: response }] };
+    } catch (error) {
+      return { content: [{ type: 'text' as const, text: formatError(error) }], isError: true };
+    }
+  },
+};
+
+const clearPlanCacheInputSchema = z.object({
+  database: z.string().optional().describe('Clear plan cache for specific database'),
+  clearAll: z.boolean().default(false).describe('Clear entire plan cache'),
+});
+
+export const clearPlanCacheTool = {
+  name: 'sqlserver_clear_plan_cache',
+  description: `Clear SQL Server plan cache. WARNING: Causes recompilation. Based on dbatools Clear-DbaPlanCache.`,
+  inputSchema: clearPlanCacheInputSchema,
+  annotations: { readOnlyHint: false },
+  handler: async (connectionManager: ConnectionManager, input: z.infer<typeof clearPlanCacheInputSchema>) => {
+    try {
+      if (input.database) {
+        await connectionManager.executeQuery(`DECLARE @dbid INT = DB_ID(@database); DBCC FLUSHPROCINDB(@dbid);`, { database: input.database });
+      } else if (input.clearAll) {
+        await connectionManager.executeQuery('DBCC FREEPROCCACHE;', {});
+      } else {
+        return { content: [{ type: 'text' as const, text: 'Error: Specify database or clearAll=true' }], isError: true };
+      }
+      const result = await connectionManager.executeQuery(`SELECT SUM(CAST(size_in_bytes AS BIGINT))/1024/1024 AS current_cache_size_mb, COUNT(*) AS cached_plans FROM sys.dm_exec_cached_plans;`, {});
+      let response = `✓ Plan cache cleared\n\n${formatResultsAsTable(result.recordset)}\n\n⚠ Queries will recompile`;
+      return { content: [{ type: 'text' as const, text: response }] };
+    } catch (error) {
+      return { content: [{ type: 'text' as const, text: formatError(error) }], isError: true };
+    }
+  },
+};
+
+// ==================== IO PERFORMANCE TOOLS (2) ====================
+
+const getIoLatencyInputSchema = z.object({
+  database: z.string().optional().describe('Filter by database'),
+});
+
+export const getIoLatencyTool = {
+  name: 'sqlserver_get_io_latency',
+  description: `Get IO latency statistics for database files. >15-20ms indicates storage issues. Based on dbatools Get-DbaIoLatency.`,
+  inputSchema: getIoLatencyInputSchema,
+  annotations: { readOnlyHint: true },
+  handler: async (connectionManager: ConnectionManager, input: z.infer<typeof getIoLatencyInputSchema>) => {
+    try {
+      const whereClause = input.database ? 'AND DB_NAME(vfs.database_id) = @database' : '';
+      const query = `SELECT DB_NAME(vfs.database_id) AS database_name, mf.name AS file_name, mf.type_desc AS file_type,
+        vfs.num_of_reads, vfs.num_of_writes, vfs.num_of_bytes_read/1024/1024 AS mb_read, vfs.num_of_bytes_written/1024/1024 AS mb_written,
+        CASE WHEN vfs.num_of_reads=0 THEN 0 ELSE CAST(vfs.io_stall_read_ms AS DECIMAL(10,2))/vfs.num_of_reads END AS avg_read_latency_ms,
+        CASE WHEN vfs.num_of_writes=0 THEN 0 ELSE CAST(vfs.io_stall_write_ms AS DECIMAL(10,2))/vfs.num_of_writes END AS avg_write_latency_ms
+        FROM sys.dm_io_virtual_file_stats(NULL, NULL) vfs JOIN sys.master_files mf ON vfs.database_id=mf.database_id AND vfs.file_id=mf.file_id
+        WHERE vfs.database_id <> 2 ${whereClause}
+        ORDER BY avg_read_latency_ms DESC, avg_write_latency_ms DESC;`;
+      const result = await connectionManager.executeQuery(query, input.database ? { database: input.database } : {});
+      let response = `IO Latency:\n\nGuidelines: <5ms Good | 5-15ms OK | 15-25ms Poor | >25ms Critical\n\n${formatResultsAsTable(result.recordset)}`;
+      return { content: [{ type: 'text' as const, text: response }] };
+    } catch (error) {
+      return { content: [{ type: 'text' as const, text: formatError(error) }], isError: true };
+    }
+  },
+};
+
+const getDiskSpaceInputSchema = z.object({});
+
+export const getDiskSpaceTool = {
+  name: 'sqlserver_get_disk_space',
+  description: `Get disk space for database files and drives. Based on dbatools Get-DbaDiskSpace.`,
+  inputSchema: getDiskSpaceInputSchema,
+  annotations: { readOnlyHint: true },
+  handler: async (connectionManager: ConnectionManager, input: z.infer<typeof getDiskSpaceInputSchema>) => {
+    try {
+      const query = `SELECT DB_NAME(database_id) AS database_name, name AS file_name, type_desc AS file_type,
+        CAST(size*8.0/1024 AS DECIMAL(10,2)) AS size_mb, CAST(FILEPROPERTY(name, 'SpaceUsed')*8.0/1024 AS DECIMAL(10,2)) AS used_mb
+        FROM sys.master_files ORDER BY database_name;
+        SELECT DISTINCT vs.volume_mount_point AS drive, CAST(vs.total_bytes/1024.0/1024/1024 AS DECIMAL(10,2)) AS total_gb,
+        CAST(vs.available_bytes/1024.0/1024/1024 AS DECIMAL(10,2)) AS available_gb,
+        CAST((vs.available_bytes*100.0/vs.total_bytes) AS DECIMAL(5,2)) AS percent_free
+        FROM sys.master_files mf CROSS APPLY sys.dm_os_volume_stats(mf.database_id, mf.file_id) vs ORDER BY drive;`;
+      const result = await connectionManager.executeQuery(query, {});
+      const recordsets = result.recordsets as any[];
+      let response = '=== Database Files ===\n' + formatResultsAsTable(recordsets[0]) + '\n\n=== Drives ===\n' + formatResultsAsTable(recordsets[1]);
+      const lowSpace = recordsets[1].filter((d: any) => d.percent_free < 15);
+      if (lowSpace.length > 0) {
+        response += '\n\n⚠ WARNING: Low disk space:\n' + lowSpace.map((d: any) => `  - ${d.drive}: ${d.percent_free}% free`).join('\n');
+      }
+      return { content: [{ type: 'text' as const, text: response }] };
+    } catch (error) {
+      return { content: [{ type: 'text' as const, text: formatError(error) }], isError: true };
+    }
+  },
+};
+
+// ==================== BLOCKING & PROCESS TOOLS (2) ====================
+
+const getBlockingInputSchema = z.object({});
+
+export const getBlockingTool = {
+  name: 'sqlserver_get_blocking',
+  description: `Identify blocking sessions. Based on dbatools Get-DbaBlocking.`,
+  inputSchema: getBlockingInputSchema,
+  annotations: { readOnlyHint: true },
+  handler: async (connectionManager: ConnectionManager, input: z.infer<typeof getBlockingInputSchema>) => {
+    try {
+      const query = `SELECT wt.blocking_session_id AS blocking_spid, s_blocking.login_name AS blocking_user,
+        wt.session_id AS blocked_spid, s_blocked.login_name AS blocked_user, wt.wait_type, wt.wait_duration_ms,
+        DB_NAME(r_blocked.database_id) AS database_name
+        FROM sys.dm_os_waiting_tasks wt
+        LEFT JOIN sys.dm_exec_sessions s_blocking ON wt.blocking_session_id = s_blocking.session_id
+        LEFT JOIN sys.dm_exec_sessions s_blocked ON wt.session_id = s_blocked.session_id
+        LEFT JOIN sys.dm_exec_requests r_blocked ON wt.session_id = r_blocked.session_id
+        WHERE wt.blocking_session_id <> 0 ORDER BY wt.wait_duration_ms DESC;`;
+      const result = await connectionManager.executeQuery(query, {});
+      if (result.recordset.length === 0) {
+        return { content: [{ type: 'text' as const, text: '✓ No blocking detected' }] };
+      }
+      let response = `⚠ BLOCKING DETECTED - ${result.recordset.length} blocked session(s)\n\n${formatResultsAsTable(result.recordset)}\n\nResolution:\n1. Optimize blocking query\n2. KILL <blocking_spid>\n3. Review isolation levels`;
+      return { content: [{ type: 'text' as const, text: response }] };
+    } catch (error) {
+      return { content: [{ type: 'text' as const, text: formatError(error) }], isError: true };
+    }
+  },
+};
+
+const getProcessInputSchema = z.object({
+  includeSystemProcesses: z.boolean().default(false).describe('Include system processes'),
+});
+
+export const getProcessTool = {
+  name: 'sqlserver_get_process',
+  description: `Get all running SQL Server processes/sessions. Based on dbatools Get-DbaProcess.`,
+  inputSchema: getProcessInputSchema,
+  annotations: { readOnlyHint: true },
+  handler: async (connectionManager: ConnectionManager, input: z.infer<typeof getProcessInputSchema>) => {
+    try {
+      const systemFilter = !input.includeSystemProcesses ? 'AND s.session_id > 50' : '';
+      const query = `SELECT s.session_id AS spid, s.login_name, s.host_name, s.program_name, s.status, s.cpu_time,
+        s.memory_usage AS memory_usage_pages, s.total_elapsed_time, s.reads AS logical_reads, s.writes,
+        DB_NAME(s.database_id) AS database_name, r.command, r.wait_type, r.blocking_session_id
+        FROM sys.dm_exec_sessions s LEFT JOIN sys.dm_exec_requests r ON s.session_id = r.session_id
+        WHERE s.session_id <> @@SPID ${systemFilter} AND s.is_user_process = 1
+        ORDER BY s.cpu_time DESC;`;
+      const result = await connectionManager.executeQuery(query, {});
+      if (result.recordset.length === 0) return { content: [{ type: 'text' as const, text: 'No active sessions' }] };
+      const activeQueries = result.recordset.filter(p => p.command);
+      let response = `Process List (${result.recordset.length} sessions):\n\nActive: ${activeQueries.length} | Idle: ${result.recordset.length - activeQueries.length}\n\n${formatResultsAsTable(result.recordset)}`;
+      return { content: [{ type: 'text' as const, text: response }] };
+    } catch (error) {
+      return { content: [{ type: 'text' as const, text: formatError(error) }], isError: true };
+    }
+  },
+};
