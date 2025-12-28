@@ -100,15 +100,20 @@ export type Config = z.infer<typeof ConfigSchema>;
  * Load configuration from environment variables
  */
 export function loadConfig(): Config {
+  const authType = (process.env.SQL_AUTH_TYPE || 'windows') as AuthType;
+
   const config = {
-    authType: process.env.SQL_AUTH_TYPE || 'windows',
+    authType,
     server: process.env.SQL_SERVER || 'localhost',
     database: process.env.SQL_DATABASE || 'master',
     port: process.env.SQL_PORT ? parseInt(process.env.SQL_PORT) : 1433,
 
     mode: process.env.SQL_MODE || 'readwrite',
 
-    trustedConnection: process.env.SQL_TRUSTED_CONNECTION === 'true',
+    // For Windows auth, default trustedConnection to true unless explicitly set to false
+    trustedConnection: authType === 'windows'
+      ? process.env.SQL_TRUSTED_CONNECTION !== 'false'
+      : process.env.SQL_TRUSTED_CONNECTION === 'true',
     domain: process.env.SQL_DOMAIN,
 
     entraAuthType: process.env.SQL_ENTRA_AUTH_TYPE,
