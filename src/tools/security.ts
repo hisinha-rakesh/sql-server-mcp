@@ -749,3 +749,1028 @@ export const dropServerRoleTool = {
     }
   },
 };
+
+/**
+ * Get Login Tool
+ * Based on dbatools Get-DbaLogin functionality
+ * Retrieves SQL Server login accounts with detailed information
+ */
+const getLoginInputSchema = z.object({
+  login: z.union([z.string(), z.array(z.string())]).optional().describe('Specific login name(s) to retrieve. If not specified, returns all logins.'),
+  excludeLogin: z.union([z.string(), z.array(z.string())]).optional().describe('Login name(s) to exclude from results.'),
+  excludeSystemLogin: z.boolean().default(false).describe('Exclude built-in system logins (sa, ##MS_*, NT AUTHORITY\\*, etc.)'),
+  type: z.enum(['Windows', 'SQL', 'All']).default('All').describe('Filter by authentication type: Windows, SQL, or All'),
+  locked: z.boolean().optional().describe('Filter to show only locked logins'),
+  disabled: z.boolean().optional().describe('Filter to show only disabled logins'),
+  hasAccess: z.boolean().optional().describe('Filter to show only logins with server access'),
+});
+
+export const getLoginTool = {
+  name: 'sqlserver_get_login',
+  description: 'Retrieve detailed information about SQL Server login accounts including authentication type, security status, server roles, and last login times. Supports filtering by type (Windows/SQL), status (locked/disabled), and custom patterns. Based on dbatools Get-DbaLogin functionality.',
+  inputSchema: getLoginInputSchema,
+  annotations: {
+    readOnlyHint: true,
+  },
+  handler: async (connectionManager: ConnectionManager, input: z.infer<typeof getLoginInputSchema>) => {
+    try {
+      const { login, excludeLogin, excludeSystemLogin, type, locked, disabled, hasAccess } = input;
+
+      let query = `
+        SELECT
+          sp.name AS LoginName,
+          sp.type_desc AS LoginType,
+          CASE
+            WHEN sp.type = 'S' THEN 'SQL Login'
+            WHEN sp.type = 'U' THEN 'Windows Login'
+            WHEN sp.type = 'G' THEN 'Windows Group'
+            WHEN sp.type = 'C' THEN 'Certificate'
+            WHEN sp.type = 'K' THEN 'Asymmetric Key'
+            ELSE sp.type_desc
+          END AS AuthenticationType,
+          sp.is_disabled AS IsDisabled,
+          sp.create_date AS CreateDate,
+          sp.modify_date AS ModifyDate,
+          sp.default_database_name AS DefaultDatabase,
+          sp.default_language_name AS DefaultLanguage,
+          LOGINPROPERTY(sp.name, 'IsLocked') AS IsLocked,
+          LOGINPROPERTY(sp.name, 'IsExpired') AS IsExpired,
+          LOGINPROPERTY(sp.name, 'IsMustChange') AS MustChangePassword,
+          LOGINPROPERTY(sp.name, 'BadPasswordCount') AS BadPasswordCount,
+          LOGINPROPERTY(sp.name, 'BadPasswordTime') AS BadPasswordTime,
+          LOGINPROPERTY(sp.name, 'PasswordLastSetTime') AS PasswordLastSetTime,
+          LOGINPROPERTY(sp.name, 'DaysUntilExpiration') AS DaysUntilExpiration,
+          CASE WHEN sp.is_disabled = 0 THEN 1 ELSE 0 END AS HasAccess,
+          (
+            SELECT STRING_AGG(r.name, ', ')
+            FROM sys.server_role_members srm
+            INNER JOIN sys.server_principals r ON srm.role_principal_id = r.principal_id
+            WHERE srm.member_principal_id = sp.principal_id
+          ) AS ServerRoles
+        FROM sys.server_principals sp
+        WHERE sp.type IN ('S', 'U', 'G', 'C', 'K')
+      `;
+
+      // Apply filters
+      if (login) {
+        const logins = Array.isArray(login) ? login : [login];
+        const loginList = logins.map(l => `'${l.replace(/'/g, "''")}'`).join(',');
+        query += ` AND sp.name IN (${loginList})`;
+      }
+
+      if (excludeLogin) {
+        const excludeLogins = Array.isArray(excludeLogin) ? excludeLogin : [excludeLogin];
+        const excludeList = excludeLogins.map(l => `'${l.replace(/'/g, "''")}'`).join(',');
+        query += ` AND sp.name NOT IN (${excludeList})`;
+      }
+
+      if (excludeSystemLogin) {
+        query += ` AND sp.name NOT IN ('sa', 'BUILTIN\\Administrators')
+                   AND sp.name NOT LIKE '##%'
+                   AND sp.name NOT LIKE 'NT AUTHORITY%'
+                   AND sp.name NOT LIKE 'NT SERVICE%'`;
+      }
+
+      if (type !== 'All') {
+        if (type === 'Windows') {
+          query += ` AND sp.type IN ('U', 'G')`;
+        } else if (type === 'SQL') {
+          query += ` AND sp.type = 'S'`;
+        }
+      }
+
+      if (locked !== undefined) {
+        query += ` AND LOGINPROPERTY(sp.name, 'IsLocked') = ${locked ? 1 : 0}`;
+      }
+
+      if (disabled !== undefined) {
+        query += ` AND sp.is_disabled = ${disabled ? 1 : 0}`;
+      }
+
+      if (hasAccess !== undefined) {
+        query += ` AND sp.is_disabled = ${hasAccess ? 0 : 1}`;
+      }
+
+      query += ` ORDER BY sp.name`;
+
+      const result = await connectionManager.executeQuery(query);
+      const logins = result.recordset;
+
+      if (logins.length === 0) {
+        return {
+          content: [{
+            type: 'text' as const,
+            text: '⚠️  No logins found matching the specified criteria.',
+          }],
+        };
+      }
+
+      let response = `SQL Server Logins (${logins.length}):\n\n`;
+      response += formatResultsAsTable(logins);
+
+      return {
+        content: [{
+          type: 'text' as const,
+          text: response,
+        }],
+      };
+
+    } catch (error) {
+      return {
+        content: [{
+          type: 'text' as const,
+          text: formatError(error),
+        }],
+        isError: true,
+      };
+    }
+  },
+};
+
+/**
+ * New Login Tool
+ * Based on dbatools New-DbaLogin functionality
+ * Creates a new SQL Server or Windows login
+ */
+const newLoginInputSchema = z.object({
+  login: z.string().describe('Name of the login to create'),
+  loginType: z.enum(['SqlLogin', 'WindowsUser', 'WindowsGroup']).default('SqlLogin').describe('Type of login to create'),
+  password: z.string().optional().describe('Password for SQL Login (required for SqlLogin type)'),
+  defaultDatabase: z.string().default('master').describe('Default database for the login'),
+  defaultLanguage: z.string().optional().describe('Default language for the login'),
+  mustChangePassword: z.boolean().default(false).describe('Force password change on first login (SQL Login only)'),
+  passwordPolicyEnforced: z.boolean().default(true).describe('Enforce password policy (SQL Login only)'),
+  passwordExpirationEnabled: z.boolean().default(false).describe('Enable password expiration (SQL Login only)'),
+  disabled: z.boolean().default(false).describe('Create login in disabled state'),
+});
+
+export const newLoginTool = {
+  name: 'sqlserver_new_login',
+  description: 'Create a new SQL Server or Windows login account. Supports SQL authentication with password policies or Windows authentication for domain users and groups. Based on dbatools New-DbaLogin functionality.',
+  inputSchema: newLoginInputSchema,
+  annotations: {
+    readOnlyHint: false,
+  },
+  handler: async (connectionManager: ConnectionManager, input: z.infer<typeof newLoginInputSchema>) => {
+    try {
+      const { login, loginType, password, defaultDatabase, defaultLanguage, mustChangePassword, passwordPolicyEnforced, passwordExpirationEnabled, disabled } = input;
+
+      // Check if login already exists
+      const checkQuery = `SELECT name FROM sys.server_principals WHERE name = @loginName`;
+      const checkResult = await connectionManager.executeQuery(checkQuery, { loginName: login });
+
+      if (checkResult.recordset.length > 0) {
+        return {
+          content: [{
+            type: 'text' as const,
+            text: `❌ Login '${login}' already exists.`,
+          }],
+          isError: true,
+        };
+      }
+
+      let createQuery = '';
+
+      if (loginType === 'SqlLogin') {
+        if (!password) {
+          return {
+            content: [{
+              type: 'text' as const,
+              text: '❌ Password is required for SQL Login.',
+            }],
+            isError: true,
+          };
+        }
+
+        createQuery = `CREATE LOGIN [${login.replace(/'/g, "''")}] WITH PASSWORD = '${password.replace(/'/g, "''")}'`;
+
+        if (mustChangePassword) {
+          createQuery += ', MUST_CHANGE';
+        }
+
+        if (passwordPolicyEnforced) {
+          createQuery += ', CHECK_POLICY = ON';
+        } else {
+          createQuery += ', CHECK_POLICY = OFF';
+        }
+
+        if (passwordExpirationEnabled) {
+          createQuery += ', CHECK_EXPIRATION = ON';
+        } else {
+          createQuery += ', CHECK_EXPIRATION = OFF';
+        }
+
+        createQuery += `, DEFAULT_DATABASE = [${defaultDatabase.replace(/'/g, "''")}]`;
+
+        if (defaultLanguage) {
+          createQuery += `, DEFAULT_LANGUAGE = [${defaultLanguage.replace(/'/g, "''")}]`;
+        }
+      } else {
+        // Windows login
+        createQuery = `CREATE LOGIN [${login.replace(/'/g, "''")}] FROM WINDOWS WITH DEFAULT_DATABASE = [${defaultDatabase.replace(/'/g, "''")}]`;
+
+        if (defaultLanguage) {
+          createQuery += `, DEFAULT_LANGUAGE = [${defaultLanguage.replace(/'/g, "''")}]`;
+        }
+      }
+
+      await connectionManager.executeQuery(createQuery);
+
+      // Disable if requested
+      if (disabled) {
+        await connectionManager.executeQuery(`ALTER LOGIN [${login.replace(/'/g, "''")}] DISABLE`);
+      }
+
+      // Get created login info
+      const infoQuery = `
+        SELECT
+          name AS LoginName,
+          type_desc AS LoginType,
+          is_disabled AS IsDisabled,
+          create_date AS CreateDate,
+          default_database_name AS DefaultDatabase,
+          default_language_name AS DefaultLanguage
+        FROM sys.server_principals
+        WHERE name = @loginName
+      `;
+      const infoResult = await connectionManager.executeQuery(infoQuery, { loginName: login });
+      const loginInfo = infoResult.recordset[0];
+
+      let response = `✅ Login created successfully:\n\n`;
+      response += `Login Name: ${loginInfo.LoginName}\n`;
+      response += `Type: ${loginInfo.LoginType}\n`;
+      response += `Disabled: ${loginInfo.IsDisabled ? 'Yes' : 'No'}\n`;
+      response += `Default Database: ${loginInfo.DefaultDatabase}\n`;
+      response += `Default Language: ${loginInfo.DefaultLanguage || 'Default'}\n`;
+      response += `Created: ${loginInfo.CreateDate}\n`;
+
+      return {
+        content: [{
+          type: 'text' as const,
+          text: response,
+        }],
+      };
+
+    } catch (error) {
+      return {
+        content: [{
+          type: 'text' as const,
+          text: formatError(error),
+        }],
+        isError: true,
+      };
+    }
+  },
+};
+
+/**
+ * Remove Login Tool
+ * Based on dbatools Remove-DbaLogin functionality
+ */
+const removeLoginInputSchema = z.object({
+  login: z.union([z.string(), z.array(z.string())]).describe('Login name(s) to remove'),
+  force: z.boolean().default(false).describe('Force removal even if login owns database objects'),
+});
+
+export const removeLoginTool = {
+  name: 'sqlserver_remove_login',
+  description: 'Remove (drop) one or more SQL Server login accounts. WARNING: This permanently deletes the login and all associated permissions. Use force parameter to remove logins that own database objects. Based on dbatools Remove-DbaLogin functionality.',
+  inputSchema: removeLoginInputSchema,
+  annotations: {
+    readOnlyHint: false,
+  },
+  handler: async (connectionManager: ConnectionManager, input: z.infer<typeof removeLoginInputSchema>) => {
+    try {
+      const { login, force } = input;
+      const logins = Array.isArray(login) ? login : [login];
+
+      const results: Array<{
+        LoginName: string;
+        Status: string;
+        Message: string;
+      }> = [];
+
+      for (const loginName of logins) {
+        try {
+          // Check if login exists
+          const checkQuery = `SELECT name, type_desc FROM sys.server_principals WHERE name = @loginName AND type IN ('S', 'U', 'G')`;
+          const checkResult = await connectionManager.executeQuery(checkQuery, { loginName });
+
+          if (checkResult.recordset.length === 0) {
+            results.push({
+              LoginName: loginName,
+              Status: 'SKIPPED',
+              Message: 'Login does not exist',
+            });
+            continue;
+          }
+
+          // Check for database ownership
+          const ownershipQuery = `
+            SELECT COUNT(*) AS OwnedDatabases
+            FROM sys.databases
+            WHERE owner_sid = SUSER_SID(@loginName)
+          `;
+          const ownershipResult = await connectionManager.executeQuery(ownershipQuery, { loginName });
+          const ownedDatabases = ownershipResult.recordset[0].OwnedDatabases;
+
+          if (ownedDatabases > 0 && !force) {
+            results.push({
+              LoginName: loginName,
+              Status: 'FAILED',
+              Message: `Login owns ${ownedDatabases} database(s). Use force parameter to remove anyway.`,
+            });
+            continue;
+          }
+
+          // If force and owns databases, transfer ownership to sa
+          if (ownedDatabases > 0 && force) {
+            const transferQuery = `
+              DECLARE @dbname NVARCHAR(128)
+              DECLARE db_cursor CURSOR FOR
+              SELECT name FROM sys.databases WHERE owner_sid = SUSER_SID(@loginName)
+
+              OPEN db_cursor
+              FETCH NEXT FROM db_cursor INTO @dbname
+
+              WHILE @@FETCH_STATUS = 0
+              BEGIN
+                EXEC('ALTER AUTHORIZATION ON DATABASE::' + QUOTENAME(@dbname) + ' TO sa')
+                FETCH NEXT FROM db_cursor INTO @dbname
+              END
+
+              CLOSE db_cursor
+              DEALLOCATE db_cursor
+            `;
+            await connectionManager.executeQuery(transferQuery, { loginName });
+          }
+
+          // Drop the login
+          await connectionManager.executeQuery(`DROP LOGIN [${loginName.replace(/'/g, "''")}]`);
+
+          results.push({
+            LoginName: loginName,
+            Status: 'SUCCESS',
+            Message: 'Login removed successfully',
+          });
+
+        } catch (error) {
+          results.push({
+            LoginName: loginName,
+            Status: 'FAILED',
+            Message: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+
+      const successCount = results.filter(r => r.Status === 'SUCCESS').length;
+      const failedCount = results.filter(r => r.Status === 'FAILED').length;
+
+      let response = `Remove Login Results:\n\n`;
+      response += `Total: ${results.length}, Success: ${successCount}, Failed: ${failedCount}\n\n`;
+      response += formatResultsAsTable(results);
+
+      return {
+        content: [{
+          type: 'text' as const,
+          text: response,
+        }],
+        isError: failedCount > 0,
+      };
+
+    } catch (error) {
+      return {
+        content: [{
+          type: 'text' as const,
+          text: formatError(error),
+        }],
+        isError: true,
+      };
+    }
+  },
+};
+
+/**
+ * Set Login Tool
+ * Based on dbatools Set-DbaLogin functionality
+ */
+const setLoginInputSchema = z.object({
+  login: z.string().describe('Login name to modify'),
+  password: z.string().optional().describe('New password (SQL Login only)'),
+  defaultDatabase: z.string().optional().describe('New default database'),
+  defaultLanguage: z.string().optional().describe('New default language'),
+  enable: z.boolean().optional().describe('Enable the login'),
+  disable: z.boolean().optional().describe('Disable the login'),
+  unlock: z.boolean().optional().describe('Unlock the login'),
+  mustChangePassword: z.boolean().optional().describe('Force password change on next login'),
+  passwordPolicyEnforced: z.boolean().optional().describe('Enforce password policy'),
+  passwordExpirationEnabled: z.boolean().optional().describe('Enable password expiration'),
+  newName: z.string().optional().describe('Rename the login to this new name'),
+});
+
+export const setLoginTool = {
+  name: 'sqlserver_set_login',
+  description: 'Modify properties of an existing SQL Server login including password, default database, enable/disable status, and password policies. Can also rename logins. Based on dbatools Set-DbaLogin functionality.',
+  inputSchema: setLoginInputSchema,
+  annotations: {
+    readOnlyHint: false,
+  },
+  handler: async (connectionManager: ConnectionManager, input: z.infer<typeof setLoginInputSchema>) => {
+    try {
+      const { login, password, defaultDatabase, defaultLanguage, enable, disable, unlock, mustChangePassword, passwordPolicyEnforced, passwordExpirationEnabled, newName } = input;
+
+      // Check if login exists
+      const checkQuery = `SELECT name, type FROM sys.server_principals WHERE name = @loginName AND type IN ('S', 'U', 'G')`;
+      const checkResult = await connectionManager.executeQuery(checkQuery, { loginName: login });
+
+      if (checkResult.recordset.length === 0) {
+        return {
+          content: [{
+            type: 'text' as const,
+            text: `❌ Login '${login}' does not exist.`,
+          }],
+          isError: true,
+        };
+      }
+
+      const loginType = checkResult.recordset[0].type;
+      const changes: string[] = [];
+
+      // Change password (SQL Login only)
+      if (password && loginType === 'S') {
+        let alterQuery = `ALTER LOGIN [${login.replace(/'/g, "''")}] WITH PASSWORD = '${password.replace(/'/g, "''")}'`;
+
+        if (mustChangePassword) {
+          alterQuery += ', MUST_CHANGE';
+        }
+
+        if (unlock) {
+          alterQuery += ' UNLOCK';
+        }
+
+        await connectionManager.executeQuery(alterQuery);
+        changes.push('Password changed');
+      }
+
+      // Change password policy (SQL Login only)
+      if (passwordPolicyEnforced !== undefined && loginType === 'S') {
+        await connectionManager.executeQuery(
+          `ALTER LOGIN [${login.replace(/'/g, "''")}] WITH CHECK_POLICY = ${passwordPolicyEnforced ? 'ON' : 'OFF'}`
+        );
+        changes.push(`Password policy ${passwordPolicyEnforced ? 'enabled' : 'disabled'}`);
+      }
+
+      // Change password expiration (SQL Login only)
+      if (passwordExpirationEnabled !== undefined && loginType === 'S') {
+        await connectionManager.executeQuery(
+          `ALTER LOGIN [${login.replace(/'/g, "''")}] WITH CHECK_EXPIRATION = ${passwordExpirationEnabled ? 'ON' : 'OFF'}`
+        );
+        changes.push(`Password expiration ${passwordExpirationEnabled ? 'enabled' : 'disabled'}`);
+      }
+
+      // Change default database
+      if (defaultDatabase) {
+        await connectionManager.executeQuery(
+          `ALTER LOGIN [${login.replace(/'/g, "''")}] WITH DEFAULT_DATABASE = [${defaultDatabase.replace(/'/g, "''")}]`
+        );
+        changes.push(`Default database set to ${defaultDatabase}`);
+      }
+
+      // Change default language
+      if (defaultLanguage) {
+        await connectionManager.executeQuery(
+          `ALTER LOGIN [${login.replace(/'/g, "''")}] WITH DEFAULT_LANGUAGE = [${defaultLanguage.replace(/'/g, "''")}]`
+        );
+        changes.push(`Default language set to ${defaultLanguage}`);
+      }
+
+      // Enable login
+      if (enable) {
+        await connectionManager.executeQuery(`ALTER LOGIN [${login.replace(/'/g, "''")}] ENABLE`);
+        changes.push('Login enabled');
+      }
+
+      // Disable login
+      if (disable) {
+        await connectionManager.executeQuery(`ALTER LOGIN [${login.replace(/'/g, "''")}] DISABLE`);
+        changes.push('Login disabled');
+      }
+
+      // Unlock login (SQL Login only)
+      if (unlock && !password && loginType === 'S') {
+        await connectionManager.executeQuery(`ALTER LOGIN [${login.replace(/'/g, "''")}] WITH PASSWORD = (SELECT CONVERT(NVARCHAR(128), password_hash, 1) FROM sys.sql_logins WHERE name = @loginName) HASHED UNLOCK`, { loginName: login });
+        changes.push('Login unlocked');
+      }
+
+      // Rename login
+      if (newName) {
+        await connectionManager.executeQuery(`ALTER LOGIN [${login.replace(/'/g, "''")}] WITH NAME = [${newName.replace(/'/g, "''")}]`);
+        changes.push(`Login renamed to ${newName}`);
+      }
+
+      if (changes.length === 0) {
+        return {
+          content: [{
+            type: 'text' as const,
+            text: '⚠️  No changes specified. Please provide at least one property to modify.',
+          }],
+        };
+      }
+
+      let response = `✅ Login modified successfully:\n\n`;
+      response += `Login: ${login}${newName ? ` → ${newName}` : ''}\n`;
+      response += `Changes:\n`;
+      changes.forEach(change => {
+        response += `  • ${change}\n`;
+      });
+
+      return {
+        content: [{
+          type: 'text' as const,
+          text: response,
+        }],
+      };
+
+    } catch (error) {
+      return {
+        content: [{
+          type: 'text' as const,
+          text: formatError(error),
+        }],
+        isError: true,
+      };
+    }
+  },
+};
+
+/**
+ * Rename Login Tool
+ * Based on dbatools Rename-DbaLogin functionality
+ */
+const renameLoginInputSchema = z.object({
+  login: z.string().describe('Current login name'),
+  newName: z.string().describe('New login name'),
+});
+
+export const renameLoginTool = {
+  name: 'sqlserver_rename_login',
+  description: 'Rename an existing SQL Server login account. This changes only the login name; all permissions and properties are preserved. Based on dbatools Rename-DbaLogin functionality.',
+  inputSchema: renameLoginInputSchema,
+  annotations: {
+    readOnlyHint: false,
+  },
+  handler: async (connectionManager: ConnectionManager, input: z.infer<typeof renameLoginInputSchema>) => {
+    try {
+      const { login, newName } = input;
+
+      // Check if source login exists
+      const checkQuery = `SELECT name FROM sys.server_principals WHERE name = @loginName AND type IN ('S', 'U', 'G')`;
+      const checkResult = await connectionManager.executeQuery(checkQuery, { loginName: login });
+
+      if (checkResult.recordset.length === 0) {
+        return {
+          content: [{
+            type: 'text' as const,
+            text: `❌ Login '${login}' does not exist.`,
+          }],
+          isError: true,
+        };
+      }
+
+      // Check if new name already exists
+      const newNameCheck = await connectionManager.executeQuery(checkQuery, { loginName: newName });
+      if (newNameCheck.recordset.length > 0) {
+        return {
+          content: [{
+            type: 'text' as const,
+            text: `❌ Login name '${newName}' already exists.`,
+          }],
+          isError: true,
+        };
+      }
+
+      // Rename the login
+      await connectionManager.executeQuery(`ALTER LOGIN [${login.replace(/'/g, "''")}] WITH NAME = [${newName.replace(/'/g, "''")}]`);
+
+      return {
+        content: [{
+          type: 'text' as const,
+          text: `✅ Login '${login}' has been renamed to '${newName}' successfully.`,
+        }],
+      };
+
+    } catch (error) {
+      return {
+        content: [{
+          type: 'text' as const,
+          text: formatError(error),
+        }],
+        isError: true,
+      };
+    }
+  },
+};
+
+/**
+ * Test Login Password Tool
+ * Based on dbatools Test-DbaLoginPassword functionality
+ */
+const testLoginPasswordInputSchema = z.object({
+  login: z.string().describe('SQL Server login name to test'),
+  password: z.string().describe('Password to test'),
+});
+
+export const testLoginPasswordTool = {
+  name: 'sqlserver_test_login_password',
+  description: 'Test if a password is correct for a SQL Server login account. This verifies credentials without locking the account on failure. Based on dbatools Test-DbaLoginPassword functionality.',
+  inputSchema: testLoginPasswordInputSchema,
+  annotations: {
+    readOnlyHint: true,
+  },
+  handler: async (connectionManager: ConnectionManager, input: z.infer<typeof testLoginPasswordInputSchema>) => {
+    try {
+      const { login, password } = input;
+
+      // Check if login exists and is SQL login
+      const checkQuery = `SELECT name, type FROM sys.server_principals WHERE name = @loginName AND type = 'S'`;
+      const checkResult = await connectionManager.executeQuery(checkQuery, { loginName: login });
+
+      if (checkResult.recordset.length === 0) {
+        return {
+          content: [{
+            type: 'text' as const,
+            text: `❌ SQL Login '${login}' does not exist or is not a SQL Server authentication login.`,
+          }],
+          isError: true,
+        };
+      }
+
+      // Test password by checking password hash
+      const testQuery = `
+        SELECT
+          CASE
+            WHEN PWDCOMPARE(@password, password_hash) = 1 THEN 1
+            ELSE 0
+          END AS PasswordMatch
+        FROM sys.sql_logins
+        WHERE name = @loginName
+      `;
+
+      const testResult = await connectionManager.executeQuery(testQuery, {
+        loginName: login,
+        password: password
+      });
+
+      const passwordMatch = testResult.recordset[0].PasswordMatch === 1;
+
+      let response = passwordMatch
+        ? `✅ Password is CORRECT for login '${login}'.`
+        : `❌ Password is INCORRECT for login '${login}'.`;
+
+      return {
+        content: [{
+          type: 'text' as const,
+          text: response,
+        }],
+        isError: !passwordMatch,
+      };
+
+    } catch (error) {
+      return {
+        content: [{
+          type: 'text' as const,
+          text: formatError(error),
+        }],
+        isError: true,
+      };
+    }
+  },
+};
+
+/**
+ * Test Windows Login Tool
+ * Based on dbatools Test-DbaWindowsLogin functionality
+ */
+const testWindowsLoginInputSchema = z.object({
+  login: z.union([z.string(), z.array(z.string())]).optional().describe('Specific Windows login(s) to test. If not specified, tests all Windows logins.'),
+});
+
+export const testWindowsLoginTool = {
+  name: 'sqlserver_test_windows_login',
+  description: 'Test if Windows logins are still valid in Active Directory. Identifies orphaned Windows accounts that no longer exist in AD but still have SQL Server access. Based on dbatools Test-DbaWindowsLogin functionality.',
+  inputSchema: testWindowsLoginInputSchema,
+  annotations: {
+    readOnlyHint: true,
+  },
+  handler: async (connectionManager: ConnectionManager, input: z.infer<typeof testWindowsLoginInputSchema>) => {
+    try {
+      const { login } = input;
+
+      let query = `
+        SELECT
+          name AS LoginName,
+          type_desc AS LoginType,
+          create_date AS CreateDate,
+          modify_date AS ModifyDate,
+          is_disabled AS IsDisabled,
+          SUSER_SID(name) AS SID
+        FROM sys.server_principals
+        WHERE type IN ('U', 'G')
+        AND name NOT LIKE 'NT AUTHORITY%'
+        AND name NOT LIKE 'NT SERVICE%'
+        AND name NOT LIKE 'BUILTIN%'
+      `;
+
+      if (login) {
+        const logins = Array.isArray(login) ? login : [login];
+        const loginList = logins.map(l => `'${l.replace(/'/g, "''")}'`).join(',');
+        query += ` AND name IN (${loginList})`;
+      }
+
+      const result = await connectionManager.executeQuery(query);
+      const logins = result.recordset;
+
+      if (logins.length === 0) {
+        return {
+          content: [{
+            type: 'text' as const,
+            text: '⚠️  No Windows logins found to test.',
+          }],
+        };
+      }
+
+      const testResults = logins.map((l: any) => ({
+        LoginName: l.LoginName,
+        LoginType: l.LoginType,
+        IsDisabled: l.IsDisabled ? 'Yes' : 'No',
+        CreateDate: l.CreateDate,
+        Status: l.SID ? 'Valid' : 'Orphaned (AD account not found)',
+      }));
+
+      const orphanedCount = testResults.filter((r: any) => r.Status.includes('Orphaned')).length;
+
+      let response = `Windows Login Test Results (${logins.length} logins tested):\n\n`;
+      response += formatResultsAsTable(testResults);
+
+      if (orphanedCount > 0) {
+        response += `\n⚠️  Found ${orphanedCount} orphaned Windows login(s) that may no longer exist in Active Directory.`;
+      } else {
+        response += `\n✅ All Windows logins are valid.`;
+      }
+
+      return {
+        content: [{
+          type: 'text' as const,
+          text: response,
+        }],
+        isError: orphanedCount > 0,
+      };
+
+    } catch (error) {
+      return {
+        content: [{
+          type: 'text' as const,
+          text: formatError(error),
+        }],
+        isError: true,
+      };
+    }
+  },
+};
+
+/**
+ * Find Login In Group Tool
+ * Based on dbatools Find-DbaLoginInGroup functionality
+ */
+const findLoginInGroupInputSchema = z.object({
+  login: z.string().optional().describe('Specific login to search for in Windows groups'),
+  groupName: z.string().optional().describe('Specific Windows group name to search in'),
+});
+
+export const findLoginInGroupTool = {
+  name: 'sqlserver_find_login_in_group',
+  description: 'Find Windows logins that are members of Windows groups with SQL Server access. Helps identify indirect login access through group membership. Based on dbatools Find-DbaLoginInGroup functionality.',
+  inputSchema: findLoginInGroupInputSchema,
+  annotations: {
+    readOnlyHint: true,
+  },
+  handler: async (connectionManager: ConnectionManager, input: z.infer<typeof findLoginInGroupInputSchema>) => {
+    try {
+      const { login, groupName } = input;
+
+      // Get all Windows groups
+      let query = `
+        SELECT
+          name AS GroupName,
+          type_desc AS GroupType,
+          create_date AS CreateDate,
+          (
+            SELECT STRING_AGG(r.name, ', ')
+            FROM sys.server_role_members srm
+            INNER JOIN sys.server_principals r ON srm.role_principal_id = r.principal_id
+            WHERE srm.member_principal_id = sp.principal_id
+          ) AS ServerRoles
+        FROM sys.server_principals sp
+        WHERE type = 'G'
+      `;
+
+      if (groupName) {
+        query += ` AND name = '${groupName.replace(/'/g, "''")}'`;
+      }
+
+      const result = await connectionManager.executeQuery(query);
+      const groups = result.recordset;
+
+      if (groups.length === 0) {
+        return {
+          content: [{
+            type: 'text' as const,
+            text: '⚠️  No Windows groups found with SQL Server access.',
+          }],
+        };
+      }
+
+      let response = `Windows Groups with SQL Server Access (${groups.length}):\n\n`;
+      response += formatResultsAsTable(groups);
+
+      if (login) {
+        response += `\n\n⚠️  Note: Membership lookup for specific users requires Windows/AD integration which is not directly available through T-SQL.\n`;
+        response += `To check if '${login}' is a member of these groups, use Active Directory tools or PowerShell's Get-ADGroupMember cmdlet.`;
+      }
+
+      return {
+        content: [{
+          type: 'text' as const,
+          text: response,
+        }],
+      };
+
+    } catch (error) {
+      return {
+        content: [{
+          type: 'text' as const,
+          text: formatError(error),
+        }],
+        isError: true,
+      };
+    }
+  },
+};
+
+/**
+ * Export Login Tool
+ * Based on dbatools Export-DbaLogin functionality
+ */
+const exportLoginInputSchema = z.object({
+  login: z.union([z.string(), z.array(z.string())]).optional().describe('Specific login(s) to export. If not specified, exports all logins.'),
+  excludeSystemLogin: z.boolean().default(true).describe('Exclude system logins from export'),
+  includeServerRoles: z.boolean().default(true).describe('Include server role memberships in export script'),
+  includePermissions: z.boolean().default(true).describe('Include server-level permissions in export script'),
+});
+
+export const exportLoginTool = {
+  name: 'sqlserver_export_login',
+  description: 'Generate T-SQL scripts to recreate logins with their passwords, server roles, and permissions. Useful for migrating logins between servers or creating login backups. Based on dbatools Export-DbaLogin functionality.',
+  inputSchema: exportLoginInputSchema,
+  annotations: {
+    readOnlyHint: true,
+  },
+  handler: async (connectionManager: ConnectionManager, input: z.infer<typeof exportLoginInputSchema>) => {
+    try {
+      const { login, excludeSystemLogin, includeServerRoles, includePermissions } = input;
+
+      let query = `
+        SELECT
+          sp.name AS LoginName,
+          sp.type AS LoginType,
+          sp.type_desc,
+          sp.is_disabled,
+          sp.default_database_name,
+          sp.default_language_name,
+          sl.password_hash,
+          sl.is_policy_checked,
+          sl.is_expiration_checked,
+          CONVERT(VARCHAR(256), SUSER_SID(sp.name), 1) AS SID
+        FROM sys.server_principals sp
+        LEFT JOIN sys.sql_logins sl ON sp.principal_id = sl.principal_id
+        WHERE sp.type IN ('S', 'U', 'G')
+      `;
+
+      if (login) {
+        const logins = Array.isArray(login) ? login : [login];
+        const loginList = logins.map(l => `'${l.replace(/'/g, "''")}'`).join(',');
+        query += ` AND sp.name IN (${loginList})`;
+      }
+
+      if (excludeSystemLogin) {
+        query += ` AND sp.name NOT IN ('sa', 'BUILTIN\\Administrators')
+                   AND sp.name NOT LIKE '##%'
+                   AND sp.name NOT LIKE 'NT AUTHORITY%'
+                   AND sp.name NOT LIKE 'NT SERVICE%'`;
+      }
+
+      query += ` ORDER BY sp.name`;
+
+      const result = await connectionManager.executeQuery(query);
+      const logins = result.recordset;
+
+      if (logins.length === 0) {
+        return {
+          content: [{
+            type: 'text' as const,
+            text: '⚠️  No logins found to export.',
+          }],
+        };
+      }
+
+      let script = `-- Login Export Script\n`;
+      script += `-- Generated: ${new Date().toISOString()}\n`;
+      script += `-- Total Logins: ${logins.length}\n\n`;
+
+      for (const loginRow of logins) {
+        script += `-- Login: ${loginRow.LoginName}\n`;
+
+        // Create login statement
+        if (loginRow.LoginType === 'S') {
+          // SQL Login
+          script += `IF NOT EXISTS (SELECT * FROM sys.server_principals WHERE name = N'${loginRow.LoginName}')\n`;
+          script += `CREATE LOGIN [${loginRow.LoginName}] WITH PASSWORD = ${loginRow.password_hash} HASHED,\n`;
+          script += `    CHECK_POLICY = ${loginRow.is_policy_checked ? 'ON' : 'OFF'},\n`;
+          script += `    CHECK_EXPIRATION = ${loginRow.is_expiration_checked ? 'ON' : 'OFF'},\n`;
+          script += `    DEFAULT_DATABASE = [${loginRow.default_database_name}]`;
+          if (loginRow.default_language_name) {
+            script += `,\n    DEFAULT_LANGUAGE = [${loginRow.default_language_name}]`;
+          }
+          script += `;\n`;
+        } else {
+          // Windows Login
+          script += `IF NOT EXISTS (SELECT * FROM sys.server_principals WHERE name = N'${loginRow.LoginName}')\n`;
+          script += `CREATE LOGIN [${loginRow.LoginName}] FROM WINDOWS WITH DEFAULT_DATABASE = [${loginRow.default_database_name}]`;
+          if (loginRow.default_language_name) {
+            script += `,\n    DEFAULT_LANGUAGE = [${loginRow.default_language_name}]`;
+          }
+          script += `;\n`;
+        }
+
+        // Set disabled status
+        if (loginRow.is_disabled) {
+          script += `ALTER LOGIN [${loginRow.LoginName}] DISABLE;\n`;
+        }
+
+        // Add server roles if requested
+        if (includeServerRoles) {
+          const rolesQuery = `
+            SELECT r.name AS RoleName
+            FROM sys.server_role_members srm
+            INNER JOIN sys.server_principals r ON srm.role_principal_id = r.principal_id
+            INNER JOIN sys.server_principals m ON srm.member_principal_id = m.principal_id
+            WHERE m.name = @loginName
+          `;
+          const rolesResult = await connectionManager.executeQuery(rolesQuery, { loginName: loginRow.LoginName });
+
+          for (const roleRow of rolesResult.recordset) {
+            script += `ALTER SERVER ROLE [${roleRow.RoleName}] ADD MEMBER [${loginRow.LoginName}];\n`;
+          }
+        }
+
+        // Add server permissions if requested
+        if (includePermissions) {
+          const permsQuery = `
+            SELECT
+              state_desc,
+              permission_name,
+              class_desc
+            FROM sys.server_permissions
+            WHERE grantee_principal_id = SUSER_ID(@loginName)
+            AND class = 100
+          `;
+          const permsResult = await connectionManager.executeQuery(permsQuery, { loginName: loginRow.LoginName });
+
+          for (const permRow of permsResult.recordset) {
+            script += `${permRow.state_desc} ${permRow.permission_name} TO [${loginRow.LoginName}];\n`;
+          }
+        }
+
+        script += `\n`;
+      }
+
+      script += `-- End of Login Export Script\n`;
+
+      return {
+        content: [{
+          type: 'text' as const,
+          text: `✅ Exported ${logins.length} login(s):\n\n\`\`\`sql\n${script}\n\`\`\``,
+        }],
+      };
+
+    } catch (error) {
+      return {
+        content: [{
+          type: 'text' as const,
+          text: formatError(error),
+        }],
+        isError: true,
+      };
+    }
+  },
+};

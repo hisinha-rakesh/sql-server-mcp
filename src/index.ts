@@ -98,6 +98,15 @@ import {
   listServerRolesTool,
   createServerRoleTool,
   dropServerRoleTool,
+  getLoginTool,
+  newLoginTool,
+  removeLoginTool,
+  setLoginTool,
+  renameLoginTool,
+  testLoginPasswordTool,
+  testWindowsLoginTool,
+  findLoginInGroupTool,
+  exportLoginTool,
 } from './tools/security.js';
 
 
@@ -214,6 +223,17 @@ const tools = [
   listServerRolesTool,
   createServerRoleTool,
   dropServerRoleTool,
+
+  // Login management tools
+  getLoginTool,
+  newLoginTool,
+  removeLoginTool,
+  setLoginTool,
+  renameLoginTool,
+  testLoginPasswordTool,
+  testWindowsLoginTool,
+  findLoginInGroupTool,
+  exportLoginTool,
 ];
 
 // Register tool list handler
