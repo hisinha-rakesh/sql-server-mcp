@@ -128,7 +128,7 @@ Reference: https://www.mssqltips.com/sqlservertip/2454/how-to-find-out-how-much-
 
       // Calculate total CPU time across all sessions
       const totalCpuTime = cpuUsage.reduce(
-        (sum, row) => sum + (row.session_cpu_time_ms || 0),
+        (sum: number, row: any) => sum + (row.session_cpu_time_ms || 0),
         0
       );
 
@@ -250,11 +250,11 @@ This is useful for identifying queries that should be optimized to reduce overal
 
       // Calculate totals
       const totalCpuTime = topQueries.reduce(
-        (sum, row) => sum + (row.total_cpu_time_ms || 0),
+        (sum: number, row: any) => sum + (row.total_cpu_time_ms || 0),
         0
       );
       const totalExecutions = topQueries.reduce(
-        (sum, row) => sum + (row.execution_count || 0),
+        (sum: number, row: any) => sum + (row.execution_count || 0),
         0
       );
 
@@ -384,11 +384,11 @@ This is essential for diagnosing performance issues and understanding where SQL 
 
       // Calculate totals
       const totalWaitTime = waitStats.reduce(
-        (sum, row) => sum + (row.wait_time_ms || 0),
+        (sum: number, row: any) => sum + (row.wait_time_ms || 0),
         0
       );
       const totalWaitCount = waitStats.reduce(
-        (sum, row) => sum + (row.wait_count || 0),
+        (sum: number, row: any) => sum + (row.wait_count || 0),
         0
       );
 
@@ -485,7 +485,7 @@ export const getDbMemoryUsageTool = {
         GROUP BY database_id ORDER BY buffer_pool_mb DESC;`;
       const result = await connectionManager.executeQuery(query, input.database ? { database: input.database } : {});
       if (result.recordset.length === 0) return { content: [{ type: 'text' as const, text: 'No buffer pool data found.' }] };
-      const totalMemory = result.recordset.reduce((sum, row) => sum + (row.buffer_pool_mb || 0), 0);
+      const totalMemory = result.recordset.reduce((sum: number, row: any) => sum + (row.buffer_pool_mb || 0), 0);
       let response = `Database Memory Usage:\n\nTotal: ${totalMemory} MB\nDatabases: ${result.recordset.length}\n\n${formatResultsAsTable(result.recordset)}`;
       return { content: [{ type: 'text' as const, text: response }] };
     } catch (error) {
@@ -555,7 +555,7 @@ export const getMaxMemoryTool = {
         WHERE name IN ('max server memory (MB)', 'min server memory (MB)') ORDER BY name;`;
       const result = await connectionManager.executeQuery(query, {});
       let response = 'SQL Server Memory Configuration:\n\n' + formatResultsAsTable(result.recordset);
-      const maxMem = result.recordset.find(r => r.name === 'max server memory (MB)');
+      const maxMem = result.recordset.find((r: any) => r.name === 'max server memory (MB)');
       if (maxMem && maxMem.config_value === 2147483647) {
         response += '\n\n⚠ WARNING: Max memory is default (2147483647 MB). Set to prevent OS instability.';
       }
@@ -612,8 +612,8 @@ export const getPlanCacheTool = {
         SUM(CASE WHEN usecounts=1 THEN CAST(size_in_bytes AS BIGINT) ELSE 0 END)/1024/1024 AS single_use_mb
         FROM sys.dm_exec_cached_plans GROUP BY objtype, cacheobjtype ORDER BY total_size_mb DESC;`;
       const result = await connectionManager.executeQuery(query, { topN });
-      const totalCacheMB = result.recordset.reduce((sum, row) => sum + (row.total_size_mb || 0), 0);
-      const totalSingleUseMB = result.recordset.reduce((sum, row) => sum + (row.single_use_mb || 0), 0);
+      const totalCacheMB = result.recordset.reduce((sum: number, row: any) => sum + (row.total_size_mb || 0), 0);
+      const totalSingleUseMB = result.recordset.reduce((sum: number, row: any) => sum + (row.single_use_mb || 0), 0);
       let response = `Plan Cache Analysis:\n\nTotal: ${totalCacheMB.toFixed(2)} MB\nSingle-Use: ${totalSingleUseMB.toFixed(2)} MB (${((totalSingleUseMB/totalCacheMB)*100).toFixed(2)}%)\n\n${formatResultsAsTable(result.recordset)}`;
       return { content: [{ type: 'text' as const, text: response }] };
     } catch (error) {
@@ -761,11 +761,207 @@ export const getProcessTool = {
         ORDER BY s.cpu_time DESC;`;
       const result = await connectionManager.executeQuery(query, {});
       if (result.recordset.length === 0) return { content: [{ type: 'text' as const, text: 'No active sessions' }] };
-      const activeQueries = result.recordset.filter(p => p.command);
+      const activeQueries = result.recordset.filter((p: any) => p.command);
       let response = `Process List (${result.recordset.length} sessions):\n\nActive: ${activeQueries.length} | Idle: ${result.recordset.length - activeQueries.length}\n\n${formatResultsAsTable(result.recordset)}`;
       return { content: [{ type: 'text' as const, text: response }] };
     } catch (error) {
       return { content: [{ type: 'text' as const, text: formatError(error) }], isError: true };
+    }
+  },
+};
+
+// ==================== DATABASE GROWTH EVENT TOOL ====================
+
+const findDbGrowthEventInputSchema = z.object({
+  database: z.string().optional().describe('Filter by specific database name. If not specified, shows growth events for all databases.'),
+  eventType: z.enum(['All', 'Data', 'Log']).default('All').describe('Filter by file type: Data (data files), Log (transaction logs), or All'),
+  days: z.number().int().min(1).max(90).default(7).describe('Number of days to look back for growth events (default: 7, max: 90)'),
+});
+
+export const findDbGrowthEventTool = {
+  name: 'sqlserver_find_db_growth_event',
+  description: `Find database file auto-growth events from the default trace.
+
+This tool helps identify when database files are auto-growing, which is important for:
+- Capacity planning and predicting future growth
+- Identifying unexpected growth patterns
+- Performance impact (auto-growth can cause blocking)
+- Verifying growth settings are appropriate
+
+Shows details including:
+- Database and file names
+- Growth amount (MB)
+- Growth duration
+- File type (Data/Log)
+- When the growth occurred
+
+Based on dbatools Find-DbaDbGrowthEvent functionality.`,
+  inputSchema: findDbGrowthEventInputSchema,
+  annotations: { readOnlyHint: true },
+  handler: async (
+    connectionManager: ConnectionManager,
+    input: z.infer<typeof findDbGrowthEventInputSchema>
+  ) => {
+    try {
+      // First, get the default trace path
+      const tracePathQuery = `
+        SELECT path
+        FROM sys.traces
+        WHERE is_default = 1
+      `;
+
+      const tracePathResult = await connectionManager.executeQuery(tracePathQuery, {});
+
+      if (!tracePathResult.recordset || tracePathResult.recordset.length === 0) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: '⚠ Default trace is not enabled on this SQL Server instance.\n\nTo enable: Run SQL Server Configuration Manager or contact your DBA.',
+            },
+          ],
+        };
+      }
+
+      const tracePath = tracePathResult.recordset[0].path;
+      const traceFolder = tracePath.substring(0, tracePath.lastIndexOf('\\'));
+
+      // Build filter conditions
+      const databaseFilter = input.database ? 'AND DatabaseName = @database' : '';
+      const fileTypeFilter =
+        input.eventType === 'Data' ? 'AND EventClass = 92' :
+        input.eventType === 'Log' ? 'AND EventClass = 93' :
+        '';
+
+      // Query to find growth events
+      const query = `
+        DECLARE @TraceFile NVARCHAR(500) = @tracePath;
+        DECLARE @DaysBack INT = @days;
+
+        SELECT
+          DatabaseName,
+          FileName,
+          CASE EventClass
+            WHEN 92 THEN 'Data'
+            WHEN 93 THEN 'Log'
+            ELSE 'Unknown'
+          END AS FileType,
+          StartTime AS GrowthTime,
+          Duration / 1000 AS DurationSeconds,
+          (IntegerData * 8.0 / 1024) AS GrowthMB,
+          (IntegerData2 * 8.0 / 1024) AS NewSizeMB,
+          ApplicationName,
+          LoginName,
+          HostName
+        FROM sys.fn_trace_gettable(@TraceFile, DEFAULT)
+        WHERE EventClass IN (92, 93)  -- 92 = Data File Auto Grow, 93 = Log File Auto Grow
+          AND StartTime >= DATEADD(day, -@DaysBack, GETDATE())
+          ${databaseFilter}
+          ${fileTypeFilter}
+        ORDER BY StartTime DESC
+      `;
+
+      const params: any = {
+        tracePath: traceFolder + '\\log.trc',
+        days: input.days
+      };
+
+      if (input.database) {
+        params.database = input.database;
+      }
+
+      const result = await connectionManager.executeQuery(query, params);
+      const growthEvents = result.recordset;
+
+      if (growthEvents.length === 0) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `No database growth events found in the last ${input.days} day(s)${input.database ? ` for database '${input.database}'` : ''}${input.eventType !== 'All' ? ` for ${input.eventType} files` : ''}.`,
+            },
+          ],
+        };
+      }
+
+      // Calculate statistics
+      const totalGrowthMB = growthEvents.reduce(
+        (sum: number, row: any) => sum + (row.GrowthMB || 0),
+        0
+      );
+      const totalDurationSec = growthEvents.reduce(
+        (sum: number, row: any) => sum + (row.DurationSeconds || 0),
+        0
+      );
+      const avgGrowthMB = totalGrowthMB / growthEvents.length;
+      const avgDurationSec = totalDurationSec / growthEvents.length;
+
+      // Count by database
+      const byDatabase = growthEvents.reduce((acc: any, row: any) => {
+        acc[row.DatabaseName] = (acc[row.DatabaseName] || 0) + 1;
+        return acc;
+      }, {});
+
+      // Count by file type
+      const byType = growthEvents.reduce((acc: any, row: any) => {
+        acc[row.FileType] = (acc[row.FileType] || 0) + 1;
+        return acc;
+      }, {});
+
+      let response = `Database Auto-Growth Events (Last ${input.days} days):\n\n`;
+
+      // Summary statistics
+      response += `Summary:\n`;
+      response += `- Total events: ${growthEvents.length}\n`;
+      response += `- Total growth: ${totalGrowthMB.toFixed(2)} MB\n`;
+      response += `- Average growth: ${avgGrowthMB.toFixed(2)} MB per event\n`;
+      response += `- Average duration: ${avgDurationSec.toFixed(2)} seconds\n`;
+      response += `- Databases affected: ${Object.keys(byDatabase).length}\n\n`;
+
+      response += `By File Type:\n`;
+      Object.entries(byType).forEach(([type, count]) => {
+        response += `- ${type}: ${count} events\n`;
+      });
+      response += `\n`;
+
+      response += `Top Databases:\n`;
+      Object.entries(byDatabase)
+        .sort(([, a]: any, [, b]: any) => b - a)
+        .slice(0, 5)
+        .forEach(([db, count]) => {
+          response += `- ${db}: ${count} events\n`;
+        });
+      response += `\n`;
+
+      // Detailed results
+      response += `Detailed Growth Events:\n\n`;
+      response += formatResultsAsTable(growthEvents);
+
+      // Add recommendations
+      response += `\n\nRecommendations:\n`;
+      response += `- Frequent growth events can cause performance issues\n`;
+      response += `- Consider pre-sizing database files to reduce auto-growth\n`;
+      response += `- Review growth settings: avoid small growth increments\n`;
+      response += `- Use fixed MB growth instead of percentage for large databases\n`;
+
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: response,
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: formatError(error),
+          },
+        ],
+        isError: true,
+      };
     }
   },
 };

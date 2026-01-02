@@ -14,7 +14,7 @@ import { ConnectionManager } from './connection.js';
 import { testConnectionTool } from './tools/connection.js';
 import {
   executeQueryTool,
-  
+  executeNonQueryTool,
   executeStoredProcedureTool,
   executeBatchTool,
 } from './tools/query.js';
@@ -147,22 +147,6 @@ import {
   revokePermissionTool,
   denyPermissionTool,
 } from './tools/security.js';
-import {
-  validatePgloaderInstallationTool,
-  validatePgloaderMigrationTool,
-  migrateDatabaseWithPgloaderTool,
-  generatePgloaderConfigTool,
-} from './tools/pgloader-migration.js';
-import {
-  dbccCheckDbTool,
-  dbccCheckTableTool,
-  dbccCheckConstraintsTool,
-  dbccShowStatisticsTool,
-  dbccFreeSystemCacheTool,
-  dbccTraceStatusTool,
-  dbccTraceOnTool,
-  dbccTraceOffTool,
-} from './tools/dbcc-operations.js';
 
 
 // Load environment variables
@@ -192,7 +176,7 @@ const tools = [
 
   // Query tools
   executeQueryTool,
-  
+  executeNonQueryTool,
   executeStoredProcedureTool,
   executeBatchTool,
 
@@ -213,16 +197,6 @@ const tools = [
   createIndexTool,
   dropIndexTool,
   findDuplicateIndexesTool,
-
-  // DBCC (Database Console Commands) tools
-  dbccCheckDbTool,
-  dbccCheckTableTool,
-  dbccCheckConstraintsTool,
-  dbccShowStatisticsTool,
-  dbccFreeSystemCacheTool,
-  dbccTraceStatusTool,
-  dbccTraceOnTool,
-  dbccTraceOffTool,
 
   // Schema tools
   listDatabasesTool,
@@ -340,12 +314,6 @@ const tools = [
   grantPermissionTool,
   revokePermissionTool,
   denyPermissionTool,
-  
-  // Database Migration tools (pgloader)
-  validatePgloaderInstallationTool,
-  validatePgloaderMigrationTool,
-  migrateDatabaseWithPgloaderTool,
-  generatePgloaderConfigTool,
 ];
 
 // Register tool list handler
@@ -433,8 +401,6 @@ const writeOperations = new Set([
   'sqlserver_restore_db_snapshot',
   'sqlserver_shrink_database',
   'sqlserver_set_db_collation',
-  // pgloader migration (write operation)
-  'sqlserver_migrate_with_pgloader',
 ]);
 
 // Register tool call handler

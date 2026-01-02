@@ -1,0 +1,106 @@
+// =====================================
+// MEMORY MANAGEMENT TOOLS (6 tools)
+// =====================================
+
+/**
+ * Get SQL Server memory usage
+ */
+const getMemoryUsageInputSchema = z.object({});
+
+export const getMemoryUsageTool = {
+  name: 'sqlserver_get_memory_usage',
+  description: `Get SQL Server memory usage statistics showing how much memory is allocated and used.
+
+This tool provides comprehensive memory usage information including:
+- Total server memory (allocated by SQL Server)
+- Target server memory (SQL Server memory target)
+- Memory usage by clerks (buffer pool, query execution, optimizer, etc.)
+- Database cache memory
+- Free memory
+- Memory state and pressure indicators
+
+Based on dbatools Get-DbaMemoryUsage functionality.`,
+  inputSchema: getMemoryUsageInputSchema,
+  annotations: {
+    readOnlyHint: true,
+  },
+  handler: async (
+    connectionManager: ConnectionManager,
+    input: z.infer<typeof getMemoryUsageInputSchema>
+  ) => {
+    try {
+      const query = `
+        SELECT
+          (physical_memory_in_use_kb / 1024) AS physical_memory_in_use_mb,
+          (locked_page_allocations_kb / 1024) AS locked_page_allocations_mb,
+          (total_virtual_address_space_kb / 1024) AS total_virtual_address_space_mb,
+          (virtual_address_space_committed_kb / 1024) AS virtual_address_space_committed_mb,
+          (virtual_address_space_available_kb / 1024) AS virtual_address_space_available_mb,
+          (page_fault_count) AS page_fault_count,
+          (memory_utilization_percentage) AS memory_utilization_percentage,
+          (available_commit_limit_kb / 1024) AS available_commit_limit_mb,
+          (process_physical_memory_low) AS process_physical_memory_low,
+          (process_virtual_memory_low) AS process_virtual_memory_low
+        FROM sys.dm_os_process_memory;
+
+        SELECT
+          (total_physical_memory_kb / 1024) AS total_physical_memory_mb,
+          (available_physical_memory_kb / 1024) AS available_physical_memory_mb,
+          (total_page_file_kb / 1024) AS total_page_file_mb,
+          (available_page_file_kb / 1024) AS available_page_file_mb,
+          system_cache_kb / 1024 AS system_cache_mb,
+          system_memory_state_desc
+        FROM sys.dm_os_sys_memory;
+
+        SELECT
+          type AS memory_clerk_type,
+          (SUM(pages_kb) / 1024) AS memory_used_mb
+        FROM sys.dm_os_memory_clerks
+        GROUP BY type
+        ORDER BY SUM(pages_kb) DESC;
+      `;
+
+      const result = await connectionManager.executeQuery(query, {});
+
+      let response = 'SQL Server Memory Usage:\n\n';
+
+      // Process memory info
+      if (result.recordsets[0] && result.recordsets[0].length > 0) {
+        response += '=== Process Memory ===\n';
+        response += formatResultsAsTable(result.recordsets[0]) + '\n';
+      }
+
+      // System memory info
+      if (result.recordsets[1] && result.recordsets[1].length > 0) {
+        response += '=== System Memory ===\n';
+        response += formatResultsAsTable(result.recordsets[1]) + '\n';
+      }
+
+      // Memory clerks
+      if (result.recordsets[2] && result.recordsets[2].length > 0) {
+        const topClerks = result.recordsets[2].slice(0, 10);
+        response += '=== Top 10 Memory Clerks ===\n';
+        response += formatResultsAsTable(topClerks);
+      }
+
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: response,
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: formatError(error),
+          },
+        ],
+        isError: true,
+      };
+    }
+  },
+};

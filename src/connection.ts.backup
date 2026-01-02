@@ -1,56 +1,29 @@
+import sql from 'mssql';
 import { Config, toMssqlConfig } from './config.js';
-
-// Import the correct driver based on authentication type
-// For Windows auth, we need to use mssql/msnodesqlv8
-// For SQL and Entra auth, we use regular mssql (tedious driver)
-async function getSqlModule(authType: string): Promise<any> {
-  if (authType === 'windows') {
-    // Use msnodesqlv8 driver for Windows authentication
-    // @ts-ignore - mssql/msnodesqlv8 doesn't have type definitions
-    const sql = await import('mssql/msnodesqlv8.js');
-    return sql.default || sql;
-  } else {
-    // Use tedious driver for SQL and Entra authentication
-    const sql = await import('mssql');
-    return sql.default || sql;
-  }
-}
 
 /**
  * Manages SQL Server connection pool
  */
 export class ConnectionManager {
-  private pool: any | null = null;
+  private pool: sql.ConnectionPool | null = null;
   private config: Config;
-  private sqlModule: any = null;
 
   constructor(config: Config) {
     this.config = config;
   }
 
   /**
-   * Ensure the correct SQL module is loaded
-   */
-  private async ensureSqlModule(): Promise<void> {
-    if (!this.sqlModule) {
-      this.sqlModule = await getSqlModule(this.config.authType);
-    }
-  }
-
-  /**
    * Get or create connection pool
    */
-  async getPool(): Promise<any> {
-    await this.ensureSqlModule();
-
+  async getPool(): Promise<sql.ConnectionPool> {
     if (this.pool && this.pool.connected) {
       return this.pool;
     }
 
     const mssqlConfig = toMssqlConfig(this.config);
-    this.pool = new this.sqlModule.ConnectionPool(mssqlConfig);
+    this.pool = new sql.ConnectionPool(mssqlConfig);
 
-    this.pool.on('error', (err: Error) => {
+    this.pool.on('error', (err) => {
       console.error('SQL Server connection pool error:', err);
     });
 
@@ -86,7 +59,7 @@ export class ConnectionManager {
   async executeQuery(
     query: string,
     params?: Record<string, any>
-  ): Promise<any> {
+  ): Promise<sql.IResult<any>> {
     const pool = await this.getPool();
     const request = pool.request();
 
@@ -106,7 +79,7 @@ export class ConnectionManager {
   async executeStoredProcedure(
     procedureName: string,
     params?: Record<string, { value?: any; type?: any; output?: boolean }>
-  ): Promise<any> {
+  ): Promise<sql.IProcedureResult<any>> {
     const pool = await this.getPool();
     const request = pool.request();
 

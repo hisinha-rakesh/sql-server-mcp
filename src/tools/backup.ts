@@ -631,3 +631,191 @@ export const getBackupDevicesTool = {
     }
   },
 };
+
+/**
+ * Restore Database Tool
+ * Based on dbatools Restore-DbaDatabase functionality
+ */
+const restoreDatabaseInputSchema = z.object({
+  backupFile: z.string().describe('Full path to the backup file to restore. Can be local path, UNC path, or Azure blob URL. For striped backups, use backupFiles array instead.'),
+  backupFiles: z.array(z.string()).optional().describe('Array of backup file paths for striped backups. If specified, backupFile is ignored.'),
+  databaseName: z.string().describe('Name of the database to restore. If different from the backup, will rename during restore.'),
+  dataFilePath: z.string().optional().describe('Directory path for data files. If not specified, uses SQL Server default data directory.'),
+  logFilePath: z.string().optional().describe('Directory path for log files. If not specified, uses SQL Server default log directory.'),
+  replace: z.boolean().default(false).describe('Overwrite existing database if it exists (WITH REPLACE). Use with caution.'),
+  recovery: z.boolean().default(true).describe('Leave database in operational state after restore (WITH RECOVERY). Set to false for log shipping or to restore additional logs.'),
+  checksum: z.boolean().default(true).describe('Enable checksum verification during restore.'),
+  azureCredential: z.string().optional().describe('SQL Server credential name for Azure blob storage authentication (if restoring from Azure).'),
+  fileRelocation: z.array(z.object({
+    logicalName: z.string().describe('Logical file name from the backup'),
+    physicalPath: z.string().describe('New physical path for the file'),
+  })).optional().describe('Manual file relocation mappings. If not specified, files are auto-relocated to default directories.'),
+});
+
+export const restoreDatabaseTool = {
+  name: 'sqlserver_restore_database',
+  description: 'Restore a database from backup file(s) with automatic file relocation, database renaming, and support for striped backups. Based on dbatools Restore-DbaDatabase functionality.',
+  inputSchema: restoreDatabaseInputSchema,
+  annotations: {
+    destructiveHint: true,
+  },
+  handler: async (connectionManager: ConnectionManager, input: z.infer<typeof restoreDatabaseInputSchema>) => {
+    try {
+      const {
+        backupFile,
+        backupFiles,
+        databaseName,
+        dataFilePath,
+        logFilePath,
+        replace = false,
+        recovery = true,
+        checksum = true,
+        azureCredential,
+        fileRelocation,
+      } = input;
+
+      const startTime = Date.now();
+
+      // Determine backup file paths
+      const backupPaths = backupFiles && backupFiles.length > 0 ? backupFiles : [backupFile];
+
+      // Get backup file information
+      let fileListQuery = `RESTORE FILELISTONLY FROM ${backupPaths.map(p => `DISK = '${p.replace(/'/g, "''")}'`).join(', ')}`;
+      if (azureCredential) {
+        fileListQuery += ` WITH CREDENTIAL = '${azureCredential.replace(/'/g, "''")}'`;
+      }
+
+      const fileListResult = await connectionManager.executeQuery(fileListQuery);
+      const files = fileListResult.recordset;
+
+      // Get default directories if not specified
+      let defaultDataPath = dataFilePath;
+      let defaultLogPath = logFilePath;
+
+      if (!defaultDataPath || !defaultLogPath) {
+        const defaultPathQuery = `
+          SELECT
+            SERVERPROPERTY('InstanceDefaultDataPath') AS DefaultDataPath,
+            SERVERPROPERTY('InstanceDefaultLogPath') AS DefaultLogPath
+        `;
+        const pathResult = await connectionManager.executeQuery(defaultPathQuery);
+        defaultDataPath = defaultDataPath || pathResult.recordset[0].DefaultDataPath;
+        defaultLogPath = defaultLogPath || pathResult.recordset[0].DefaultLogPath;
+      }
+
+      // Build file relocation mappings
+      const moveStatements: string[] = [];
+
+      if (fileRelocation && fileRelocation.length > 0) {
+        // Use manual relocation
+        for (const mapping of fileRelocation) {
+          moveStatements.push(`MOVE '${mapping.logicalName}' TO '${mapping.physicalPath}'`);
+        }
+      } else {
+        // Auto-relocate files
+        for (const file of files) {
+          const logicalName = file.LogicalName;
+          const fileType = file.Type; // 'D' for data, 'L' for log
+          const originalFileName = file.PhysicalName.split('\\').pop() || file.PhysicalName.split('/').pop();
+
+          // Generate new file name with database name
+          let newFileName = originalFileName;
+          const originalDbName = files[0].PhysicalName.match(/([^\\\/]+)\.(mdf|ndf|ldf)$/i)?.[1];
+          if (originalDbName) {
+            newFileName = originalFileName.replace(originalDbName, databaseName);
+          } else {
+            // Fallback: prepend database name
+            const extension = originalFileName.match(/\.(mdf|ndf|ldf)$/i)?.[0] || '';
+            const baseName = originalFileName.replace(/\.(mdf|ndf|ldf)$/i, '');
+            newFileName = `${databaseName}${baseName ? '_' + baseName : ''}${extension}`;
+          }
+
+          const targetPath = fileType === 'L' ? defaultLogPath : defaultDataPath;
+          if (!targetPath) {
+            throw new Error(`Unable to determine target path for file type ${fileType}`);
+          }
+          const newFilePath = targetPath.endsWith('\\') || targetPath.endsWith('/')
+            ? targetPath + newFileName
+            : targetPath + '\\' + newFileName;
+
+          moveStatements.push(`MOVE '${logicalName}' TO '${newFilePath}'`);
+        }
+      }
+
+      // Build RESTORE DATABASE command
+      let restoreCommand = `RESTORE DATABASE [${databaseName}]\n`;
+      restoreCommand += backupPaths.map((p, idx) => `  ${idx === 0 ? 'FROM' : ','} DISK = '${p}'`).join('\n');
+
+      // Add WITH options
+      const withOptions: string[] = [...moveStatements];
+
+      if (replace) withOptions.push('REPLACE');
+      if (recovery) {
+        withOptions.push('RECOVERY');
+      } else {
+        withOptions.push('NORECOVERY');
+      }
+      if (checksum) withOptions.push('CHECKSUM');
+      if (azureCredential) withOptions.push(`CREDENTIAL = '${azureCredential}'`);
+      withOptions.push('STATS = 10');
+
+      if (withOptions.length > 0) {
+        restoreCommand += '\n  WITH ' + withOptions.join(',\n       ');
+      }
+
+      // Execute restore
+      await connectionManager.executeQuery(restoreCommand);
+
+      const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+
+      // Get restored database info
+      const dbInfoQuery = `
+        SELECT
+          d.name AS DatabaseName,
+          d.state_desc AS State,
+          d.recovery_model_desc AS RecoveryModel,
+          d.compatibility_level AS CompatibilityLevel,
+          CAST(SUM(mf.size) * 8.0 / 1024 AS DECIMAL(10, 2)) AS SizeMB
+        FROM sys.databases d
+        LEFT JOIN sys.master_files mf ON d.database_id = mf.database_id
+        WHERE d.name = '${databaseName.replace(/'/g, "''")}'
+        GROUP BY d.name, d.state_desc, d.recovery_model_desc, d.compatibility_level
+      `;
+      const dbInfo = await connectionManager.executeQuery(dbInfoQuery);
+      const dbData = dbInfo.recordset[0];
+
+      let response = `✅ Database Restored Successfully\n\n`;
+      response += `Database: ${databaseName}\n`;
+      response += `Backup File(s): ${backupPaths.join(', ')}\n`;
+      response += `Restore Duration: ${duration}s\n`;
+      response += `Recovery State: ${recovery ? 'RECOVERY' : 'NORECOVERY'}\n\n`;
+      response += `Database Information:\n`;
+      response += `  State: ${dbData.State}\n`;
+      response += `  Recovery Model: ${dbData.RecoveryModel}\n`;
+      response += `  Compatibility Level: ${dbData.CompatibilityLevel}\n`;
+      response += `  Size: ${dbData.SizeMB} MB\n\n`;
+      response += `Files Restored:\n`;
+      response += formatResultsAsTable(files.map((file: any, idx: number) => ({
+        LogicalName: file.LogicalName,
+        Type: file.Type === 'D' ? 'Data' : 'Log',
+        NewLocation: moveStatements[idx]?.match(/TO '([^']+)'/)?.[1] || 'N/A',
+      })));
+
+      return {
+        content: [{
+          type: 'text' as const,
+          text: response,
+        }],
+      };
+
+    } catch (error) {
+      return {
+        content: [{
+          type: 'text' as const,
+          text: `❌ Database Restore Failed\n\n` + formatError(error),
+        }],
+        isError: true,
+      };
+    }
+  },
+};

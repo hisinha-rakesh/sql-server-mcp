@@ -32,10 +32,10 @@ export const listAgentJobsTool = {
           j.date_modified,
           SUSER_SNAME(j.owner_sid) AS owner,
           CASE
-            WHEN js.next_run_date = 0 THEN NULL
+            WHEN ISNULL(sched.next_run_date, 0) = 0 THEN NULL
             ELSE CONVERT(DATETIME,
-              CONVERT(VARCHAR(8), js.next_run_date) + ' ' +
-              STUFF(STUFF(RIGHT('000000' + CONVERT(VARCHAR(6), js.next_run_time), 6), 5, 0, ':'), 3, 0, ':')
+              CONVERT(VARCHAR(8), sched.next_run_date) + ' ' +
+              STUFF(STUFF(RIGHT('000000' + CONVERT(VARCHAR(6), sched.next_run_time), 6), 5, 0, ':'), 3, 0, ':')
             )
           END AS next_run_time,
           CASE js.last_run_outcome
@@ -47,7 +47,7 @@ export const listAgentJobsTool = {
             ELSE 'N/A'
           END AS last_run_status,
           CASE
-            WHEN js.last_run_date = 0 THEN NULL
+            WHEN ISNULL(js.last_run_date, 0) = 0 THEN NULL
             ELSE CONVERT(DATETIME,
               CONVERT(VARCHAR(8), js.last_run_date) + ' ' +
               STUFF(STUFF(RIGHT('000000' + CONVERT(VARCHAR(6), js.last_run_time), 6), 5, 0, ':'), 3, 0, ':')
@@ -56,6 +56,12 @@ export const listAgentJobsTool = {
           (SELECT COUNT(*) FROM msdb.dbo.sysjobsteps WHERE job_id = j.job_id) AS step_count
         FROM msdb.dbo.sysjobs j
         LEFT JOIN msdb.dbo.sysjobservers js ON j.job_id = js.job_id
+        LEFT JOIN (
+          SELECT job_id, MIN(next_run_date) AS next_run_date, MIN(next_run_time) AS next_run_time
+          FROM msdb.dbo.sysjobschedules
+          WHERE next_run_date > 0
+          GROUP BY job_id
+        ) sched ON j.job_id = sched.job_id
         ${whereClause}
         ORDER BY j.name
       `;

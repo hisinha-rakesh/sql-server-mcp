@@ -88,7 +88,6 @@ export const getDatabaseSizeTool = {
           SUM(CASE WHEN type_desc = 'ROWS' THEN CAST(size AS BIGINT) * 8 / 1024 ELSE 0 END) AS data_size_mb,
           SUM(CASE WHEN type_desc = 'LOG' THEN CAST(size AS BIGINT) * 8 / 1024 ELSE 0 END) AS log_size_mb
         FROM sys.database_files
-        GROUP BY DB_NAME()
       `;
 
       const result = await connectionManager.executeQuery(query);

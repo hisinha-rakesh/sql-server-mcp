@@ -56,6 +56,12 @@ const dropIndexInputSchema = z.object({
   tableName: z.string().min(1).describe('Table name (can include schema, e.g., dbo.TableName)'),
 });
 
+const findDuplicateIndexesInputSchema = z.object({
+  database: z.string().optional().describe('Specific database to check. If not specified, checks current database.'),
+  tableName: z.string().optional().describe('Specific table to check (can include schema). If not specified, checks all tables.'),
+  includeOverlapping: z.boolean().optional().default(false).describe('Include overlapping indexes (indexes with some matching key columns but not all). Default: false (only exact duplicates).'),
+});
+
 /**
  * Create a new table
  */
@@ -418,6 +424,197 @@ export const dropIndexTool = {
               `Index: ${input.indexName}\n` +
               `Table: ${input.tableName}\n` +
               `Execution time: ${executionTime}ms`,
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: formatError(error),
+          },
+        ],
+        isError: true,
+      };
+    }
+  },
+};
+
+/**
+ * Find duplicate and overlapping indexes
+ * Based on dbatools Find-DbaDbDuplicateIndex
+ */
+export const findDuplicateIndexesTool = {
+  name: 'sqlserver_find_duplicate_indexes',
+  description: 'Find duplicate and overlapping indexes that waste storage space and degrade write performance. Duplicate indexes have identical key columns, included columns, and filters. Overlapping indexes share some key columns. Based on dbatools Find-DbaDbDuplicateIndex.',
+  inputSchema: findDuplicateIndexesInputSchema,
+  annotations: {
+    destructiveHint: false,
+    readOnlyHint: true,
+  },
+  handler: async (connectionManager: ConnectionManager, input: z.infer<typeof findDuplicateIndexesInputSchema>) => {
+    try {
+      // Build the query to find duplicate/overlapping indexes
+      const query = `
+        WITH IndexColumns AS (
+          SELECT
+            OBJECT_SCHEMA_NAME(i.object_id) AS schema_name,
+            OBJECT_NAME(i.object_id) AS table_name,
+            i.name AS index_name,
+            i.index_id,
+            i.type_desc AS index_type,
+            i.is_unique,
+            i.is_primary_key,
+            i.is_disabled,
+            -- Get key columns
+            STUFF((
+              SELECT ',' + c.name + CASE WHEN ic.is_descending_key = 1 THEN ' DESC' ELSE ' ASC' END
+              FROM sys.index_columns ic
+              INNER JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+              WHERE ic.object_id = i.object_id
+                AND ic.index_id = i.index_id
+                AND ic.is_included_column = 0
+              ORDER BY ic.key_ordinal
+              FOR XML PATH('')
+            ), 1, 1, '') AS key_columns,
+            -- Get included columns
+            STUFF((
+              SELECT ',' + c.name
+              FROM sys.index_columns ic
+              INNER JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+              WHERE ic.object_id = i.object_id
+                AND ic.index_id = i.index_id
+                AND ic.is_included_column = 1
+              ORDER BY ic.index_column_id
+              FOR XML PATH('')
+            ), 1, 1, '') AS included_columns,
+            i.filter_definition,
+            ps.row_count,
+            ps.reserved_page_count * 8.0 / 1024 AS size_mb
+          FROM sys.indexes i
+          LEFT JOIN sys.dm_db_partition_stats ps
+            ON i.object_id = ps.object_id AND i.index_id = ps.index_id
+          WHERE i.type_desc IN ('NONCLUSTERED', 'CLUSTERED')
+            AND OBJECT_NAME(i.object_id) NOT LIKE 'sys%'
+            ${input.tableName ? `AND OBJECT_NAME(i.object_id) = '${input.tableName.split('.').pop()}'` : ''}
+        )
+        SELECT
+          i1.schema_name,
+          i1.table_name,
+          i1.index_name AS index1_name,
+          i1.index_type AS index1_type,
+          i1.is_unique AS index1_is_unique,
+          i1.is_primary_key AS index1_is_primary_key,
+          i1.is_disabled AS index1_is_disabled,
+          i1.key_columns AS index1_key_columns,
+          i1.included_columns AS index1_included_columns,
+          i1.filter_definition AS index1_filter,
+          i1.row_count AS index1_row_count,
+          i1.size_mb AS index1_size_mb,
+          i2.index_name AS index2_name,
+          i2.index_type AS index2_type,
+          i2.is_unique AS index2_is_unique,
+          i2.is_primary_key AS index2_is_primary_key,
+          i2.is_disabled AS index2_is_disabled,
+          i2.key_columns AS index2_key_columns,
+          i2.included_columns AS index2_included_columns,
+          i2.filter_definition AS index2_filter,
+          i2.row_count AS index2_row_count,
+          i2.size_mb AS index2_size_mb,
+          CASE
+            WHEN i1.key_columns = i2.key_columns
+              AND ISNULL(i1.included_columns, '') = ISNULL(i2.included_columns, '')
+              AND ISNULL(i1.filter_definition, '') = ISNULL(i2.filter_definition, '')
+            THEN 'Exact Duplicate'
+            ELSE 'Overlapping'
+          END AS duplicate_type
+        FROM IndexColumns i1
+        INNER JOIN IndexColumns i2
+          ON i1.table_name = i2.table_name
+          AND i1.schema_name = i2.schema_name
+          AND i1.index_id < i2.index_id
+        WHERE
+          -- Exact duplicates: same key columns, included columns, and filter
+          (
+            i1.key_columns = i2.key_columns
+            AND ISNULL(i1.included_columns, '') = ISNULL(i2.included_columns, '')
+            AND ISNULL(i1.filter_definition, '') = ISNULL(i2.filter_definition, '')
+          )
+          ${input.includeOverlapping ? `
+          -- Or overlapping: key columns share some columns (for overlapping mode)
+          OR (
+            i1.key_columns LIKE i2.key_columns + ',%'
+            OR i2.key_columns LIKE i1.key_columns + ',%'
+            OR i1.key_columns LIKE '%,' + i2.key_columns
+            OR i2.key_columns LIKE '%,' + i1.key_columns
+          )` : ''}
+        ORDER BY i1.schema_name, i1.table_name, i1.index_name;
+      `;
+
+      const startTime = Date.now();
+      const result = await connectionManager.executeQuery(query);
+      const executionTime = Date.now() - startTime;
+
+      if (!result.recordset || result.recordset.length === 0) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `✓ No duplicate${input.includeOverlapping ? ' or overlapping' : ''} indexes found\n\n` +
+                `Database: ${input.database || 'current database'}\n` +
+                `${input.tableName ? `Table: ${input.tableName}\n` : 'All tables checked\n'}` +
+                `Execution time: ${executionTime}ms`,
+            },
+          ],
+        };
+      }
+
+      // Format the results
+      const exactDuplicates = result.recordset.filter((r: any) => r.duplicate_type === 'Exact Duplicate');
+      const overlapping = result.recordset.filter((r: any) => r.duplicate_type === 'Overlapping');
+
+      let text = `Found ${result.recordset.length} duplicate/overlapping index ${result.recordset.length === 1 ? 'pair' : 'pairs'}\n\n`;
+
+      if (exactDuplicates.length > 0) {
+        text += `=== Exact Duplicates (${exactDuplicates.length}) ===\n\n`;
+        exactDuplicates.forEach((row: any, idx: number) => {
+          text += `${idx + 1}. Table: ${row.schema_name}.${row.table_name}\n`;
+          text += `   Index 1: ${row.index1_name} (${row.index1_type}${row.index1_is_unique ? ', UNIQUE' : ''}${row.index1_is_primary_key ? ', PRIMARY KEY' : ''})\n`;
+          text += `     Key Columns: ${row.index1_key_columns || 'None'}\n`;
+          if (row.index1_included_columns) {
+            text += `     Included: ${row.index1_included_columns}\n`;
+          }
+          text += `     Size: ${row.index1_size_mb?.toFixed(2) || '0.00'} MB\n`;
+          text += `   Index 2: ${row.index2_name} (${row.index2_type}${row.index2_is_unique ? ', UNIQUE' : ''}${row.index2_is_primary_key ? ', PRIMARY KEY' : ''})\n`;
+          text += `     Key Columns: ${row.index2_key_columns || 'None'}\n`;
+          if (row.index2_included_columns) {
+            text += `     Included: ${row.index2_included_columns}\n`;
+          }
+          text += `     Size: ${row.index2_size_mb?.toFixed(2) || '0.00'} MB\n`;
+          text += `   💡 Recommendation: Drop one of these indexes (prefer keeping PRIMARY KEY or UNIQUE)\n\n`;
+        });
+      }
+
+      if (overlapping.length > 0) {
+        text += `=== Overlapping Indexes (${overlapping.length}) ===\n\n`;
+        overlapping.forEach((row: any, idx: number) => {
+          text += `${idx + 1}. Table: ${row.schema_name}.${row.table_name}\n`;
+          text += `   Index 1: ${row.index1_name}\n`;
+          text += `     Key Columns: ${row.index1_key_columns || 'None'}\n`;
+          text += `   Index 2: ${row.index2_name}\n`;
+          text += `     Key Columns: ${row.index2_key_columns || 'None'}\n`;
+          text += `   💡 Consider consolidating these indexes\n\n`;
+        });
+      }
+
+      text += `Execution time: ${executionTime}ms`;
+
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text,
           },
         ],
       };

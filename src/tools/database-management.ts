@@ -389,7 +389,7 @@ export const newDbSnapshotTool = {
         return { content: [{ type: 'text' as const, text: `Database '${input.database}' not found` }], isError: true };
       }
 
-      const fileSpecs = filesResult.recordset.map(f => {
+      const fileSpecs = filesResult.recordset.map((f: any) => {
         const basePath = input.path || f.physical_name.substring(0, f.physical_name.lastIndexOf('\\'));
         const extension = '.ss';
         const snapshotFile = `${basePath}\\${f.name}_${timestamp}${extension}`;
