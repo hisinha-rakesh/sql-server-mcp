@@ -166,7 +166,7 @@ export function toMssqlConfig(config: Config): sql.config {
   } else if (config.authType === 'windows') {
     // Windows Authentication using msnodesqlv8 driver
     // For msnodesqlv8, use connection string to properly set TrustServerCertificate
-    const connectionString = `Server=${config.server}${config.port !== 1433 ? ',' + config.port : ''};Database=${config.database};Trusted_Connection=yes;Driver={SQL Server Native Client 11.0};${config.trustServerCertificate ? 'TrustServerCertificate=yes;' : ''}`;
+    const connectionString = `Server=${config.server}${config.port !== 1433 ? ',' + config.port : ''};Database=${config.database};Trusted_Connection=yes;Driver={ODBC Driver 17 for SQL Server};${config.trustServerCertificate ? 'TrustServerCertificate=yes;' : ''}`;
 
     return {
       server: config.server,

@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "sql-server": {
+      "command": "node",
+      "args": ["C:\\Users\\admina\\sqlservermcp\\sql-server-mcp\\dist\\index.js"],
+      "env": {
+        "SQL_AUTH_TYPE": "windows",
+        "SQL_SERVER": "localhost",
+        "SQL_DATABASE": "master",
+        "SQL_TRUSTED_CONNECTION": "true",
+        "SQL_ENCRYPT": "true",
+        "SQL_TRUST_SERVER_CERTIFICATE": "true"
+      }
+    }
+  }
+}
