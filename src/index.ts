@@ -163,6 +163,14 @@ import {
   dbccTraceOnTool,
   dbccTraceOffTool,
 } from './tools/dbcc-operations.js';
+import {
+  getQueryStoreStatusTool,
+  enableQueryStoreTool,
+  disableQueryStoreTool,
+  getQueryStoreTopQueriesTool,
+  getQueryStoreRegressedQueriesTool,
+  clearQueryStoreTool,
+} from './tools/query-store.js';
 
 
 // Load environment variables
@@ -346,6 +354,14 @@ const tools = [
   validatePgloaderMigrationTool,
   migrateDatabaseWithPgloaderTool,
   generatePgloaderConfigTool,
+
+  // Query Store tools
+  getQueryStoreStatusTool,
+  enableQueryStoreTool,
+  disableQueryStoreTool,
+  getQueryStoreTopQueriesTool,
+  getQueryStoreRegressedQueriesTool,
+  clearQueryStoreTool,
 ];
 
 // Register tool list handler
@@ -435,6 +451,10 @@ const writeOperations = new Set([
   'sqlserver_set_db_collation',
   // pgloader migration (write operation)
   'sqlserver_migrate_with_pgloader',
+  // Query Store write operations
+  'sqlserver_enable_query_store',
+  'sqlserver_disable_query_store',
+  'sqlserver_clear_query_store',
 ]);
 
 // Register tool call handler

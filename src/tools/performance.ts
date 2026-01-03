@@ -612,9 +612,14 @@ export const getPlanCacheTool = {
         SUM(CASE WHEN usecounts=1 THEN CAST(size_in_bytes AS BIGINT) ELSE 0 END)/1024/1024 AS single_use_mb
         FROM sys.dm_exec_cached_plans GROUP BY objtype, cacheobjtype ORDER BY total_size_mb DESC;`;
       const result = await connectionManager.executeQuery(query, { topN });
-      const totalCacheMB = result.recordset.reduce((sum: number, row: any) => sum + (row.total_size_mb || 0), 0);
-      const totalSingleUseMB = result.recordset.reduce((sum: number, row: any) => sum + (row.single_use_mb || 0), 0);
-      let response = `Plan Cache Analysis:\n\nTotal: ${totalCacheMB.toFixed(2)} MB\nSingle-Use: ${totalSingleUseMB.toFixed(2)} MB (${((totalSingleUseMB/totalCacheMB)*100).toFixed(2)}%)\n\n${formatResultsAsTable(result.recordset)}`;
+
+      // Convert to Number explicitly to handle BigInt values from SQL Server BIGINT type
+      const totalCacheMB = result.recordset.reduce((sum: number, row: any) => sum + Number(row.total_size_mb || 0), 0);
+      const totalSingleUseMB = result.recordset.reduce((sum: number, row: any) => sum + Number(row.single_use_mb || 0), 0);
+
+      // Handle division by zero when cache is empty
+      const percentage = totalCacheMB > 0 ? ((totalSingleUseMB / totalCacheMB) * 100).toFixed(2) : '0.00';
+      let response = `Plan Cache Analysis:\n\nTotal: ${totalCacheMB.toFixed(2)} MB\nSingle-Use: ${totalSingleUseMB.toFixed(2)} MB (${percentage}%)\n\n${formatResultsAsTable(result.recordset)}`;
       return { content: [{ type: 'text' as const, text: response }] };
     } catch (error) {
       return { content: [{ type: 'text' as const, text: formatError(error) }], isError: true };

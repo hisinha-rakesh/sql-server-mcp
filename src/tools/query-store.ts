@@ -81,27 +81,156 @@ export const getQueryStoreStatusTool = {
 
 /**
  * Enable Query Store Tool
- * Enables Query Store for a database
+ * Enables Query Store for a database after checking version and edition compatibility
  */
 const enableQueryStoreInputSchema = z.object({
   database: z.string().describe('Database name to enable Query Store'),
   maxStorageSizeMB: z.number().default(1000).optional().describe('Maximum storage size in MB (default: 1000)'),
   queryCaptureMode: z.enum(['ALL', 'AUTO', 'NONE', 'CUSTOM']).default('AUTO').optional().describe('Query capture mode'),
   cleanupMode: z.enum(['AUTO', 'OFF']).default('AUTO').optional().describe('Size-based cleanup mode'),
+  waitStatsCaptureMode: z.enum(['ON', 'OFF']).default('ON').optional().describe('Wait statistics capture mode (SQL Server 2017+)'),
+  maxPlansPerQuery: z.number().default(200).optional().describe('Maximum plans per query (default: 200)'),
 });
 
 export const enableQueryStoreTool = {
   name: 'sqlserver_enable_query_store',
-  description: 'Enable Query Store for a database with specified configuration. Query Store captures query performance metrics for troubleshooting and optimization.',
+  description: `Enable Query Store for a database after checking SQL Server version and edition compatibility.
+
+Query Store is available in:
+- SQL Server 2016 (13.x) and later: Standard, Enterprise, Developer, Web, Express editions
+- Azure SQL Database: All tiers
+- Azure SQL Managed Instance: All tiers
+
+The tool automatically:
+1. Checks SQL Server version (requires 13.x / 2016 or later)
+2. Validates edition compatibility
+3. Adjusts options based on version (e.g., wait stats capture for 2017+)
+4. Enables Query Store with optimal settings`,
   inputSchema: enableQueryStoreInputSchema,
   annotations: {
     readOnlyHint: false,
   },
   handler: async (connectionManager: ConnectionManager, input: z.infer<typeof enableQueryStoreInputSchema>) => {
     try {
-      const { database, maxStorageSizeMB, queryCaptureMode, cleanupMode } = input;
+      const { database, maxStorageSizeMB, queryCaptureMode, cleanupMode, waitStatsCaptureMode, maxPlansPerQuery } = input;
 
-      const query = `
+      // Step 1: Check SQL Server version and edition
+      const versionQuery = `
+        SELECT
+          SERVERPROPERTY('ProductVersion') AS ProductVersion,
+          SERVERPROPERTY('ProductMajorVersion') AS MajorVersion,
+          SERVERPROPERTY('ProductMinorVersion') AS MinorVersion,
+          SERVERPROPERTY('Edition') AS Edition,
+          SERVERPROPERTY('EngineEdition') AS EngineEdition,
+          SERVERPROPERTY('ProductLevel') AS ProductLevel,
+          @@VERSION AS FullVersion
+      `;
+
+      const versionResult = await connectionManager.executeQuery(versionQuery, {});
+      const serverInfo = versionResult.recordset[0];
+
+      const majorVersion = parseInt(serverInfo.MajorVersion || serverInfo.ProductVersion?.split('.')[0] || '0');
+      const edition = serverInfo.Edition as string;
+      const engineEdition = serverInfo.EngineEdition as number;
+
+      // Query Store minimum version is SQL Server 2016 (version 13)
+      const minVersion = 13;
+
+      // Version check
+      if (majorVersion < minVersion) {
+        return {
+          content: [{
+            type: 'text' as const,
+            text: `Query Store is NOT supported on this SQL Server version.\n\n` +
+                  `Current Version:\n` +
+                  `- Product Version: ${serverInfo.ProductVersion}\n` +
+                  `- Edition: ${edition}\n` +
+                  `- Full Version: ${serverInfo.FullVersion}\n\n` +
+                  `Requirements:\n` +
+                  `- SQL Server 2016 (version 13.x) or later\n` +
+                  `- Azure SQL Database (any tier)\n` +
+                  `- Azure SQL Managed Instance (any tier)\n\n` +
+                  `Your SQL Server major version is ${majorVersion}, but Query Store requires version 13 or higher.`,
+          }],
+          isError: true,
+        };
+      }
+
+      // Edition check - Query Store is available in all editions of SQL Server 2016+
+      // EngineEdition values: 1=Personal/Desktop, 2=Standard, 3=Enterprise, 4=Express, 5=Azure SQL DB, 6=Azure Synapse, 8=Azure SQL MI
+      const supportedEngineEditions = [2, 3, 4, 5, 6, 8]; // Standard, Enterprise, Express, Azure SQL DB, Azure Synapse, Azure SQL MI
+      const supportedEditionPatterns = ['Standard', 'Enterprise', 'Developer', 'Web', 'Express', 'Azure'];
+
+      const isEditionSupported = supportedEngineEditions.includes(engineEdition) ||
+        supportedEditionPatterns.some(pattern => edition.toLowerCase().includes(pattern.toLowerCase()));
+
+      if (!isEditionSupported) {
+        return {
+          content: [{
+            type: 'text' as const,
+            text: `Query Store may not be supported on this edition.\n\n` +
+                  `Current Edition: ${edition}\n` +
+                  `Engine Edition Code: ${engineEdition}\n\n` +
+                  `Query Store is supported on:\n` +
+                  `- SQL Server: Standard, Enterprise, Developer, Web, Express editions\n` +
+                  `- Azure SQL Database: All tiers\n` +
+                  `- Azure SQL Managed Instance: All tiers\n\n` +
+                  `Proceeding may fail if your edition does not support Query Store.`,
+          }],
+          isError: true,
+        };
+      }
+
+      // Step 2: Check if database exists and is accessible
+      const dbCheckQuery = `
+        SELECT
+          name,
+          state_desc AS DatabaseState,
+          is_read_only AS IsReadOnly,
+          is_query_store_on AS QueryStoreAlreadyEnabled
+        FROM sys.databases
+        WHERE name = @database
+      `;
+
+      const dbCheckResult = await connectionManager.executeQuery(dbCheckQuery, { database });
+
+      if (dbCheckResult.recordset.length === 0) {
+        return {
+          content: [{
+            type: 'text' as const,
+            text: `Database '${database}' not found.`,
+          }],
+          isError: true,
+        };
+      }
+
+      const dbInfo = dbCheckResult.recordset[0];
+
+      if (dbInfo.DatabaseState !== 'ONLINE') {
+        return {
+          content: [{
+            type: 'text' as const,
+            text: `Database '${database}' is not online (current state: ${dbInfo.DatabaseState}). Query Store can only be enabled on online databases.`,
+          }],
+          isError: true,
+        };
+      }
+
+      if (dbInfo.QueryStoreAlreadyEnabled) {
+        return {
+          content: [{
+            type: 'text' as const,
+            text: `Query Store is already enabled for database '${database}'.\n\n` +
+                  `Use sqlserver_get_query_store_status to view current configuration.`,
+          }],
+        };
+      }
+
+      // Step 3: Build the ALTER DATABASE command based on version
+      // WAIT_STATS_CAPTURE_MODE is only available in SQL Server 2017 (14.x) and later
+      const supportsWaitStats = majorVersion >= 14;
+
+      let alterQuery = `
         ALTER DATABASE [${database}]
         SET QUERY_STORE = ON (
           OPERATION_MODE = READ_WRITE,
@@ -110,21 +239,51 @@ export const enableQueryStoreTool = {
           SIZE_BASED_CLEANUP_MODE = ${cleanupMode},
           DATA_FLUSH_INTERVAL_SECONDS = 900,
           INTERVAL_LENGTH_MINUTES = 60,
-          STALE_QUERY_THRESHOLD_DAYS = 30
+          STALE_QUERY_THRESHOLD_DAYS = 30,
+          MAX_PLANS_PER_QUERY = ${maxPlansPerQuery}`;
+
+      if (supportsWaitStats) {
+        alterQuery += `,
+          WAIT_STATS_CAPTURE_MODE = ${waitStatsCaptureMode}`;
+      }
+
+      alterQuery += `
         );
       `;
 
-      await connectionManager.executeQuery(query);
+      await connectionManager.executeQuery(alterQuery, {});
+
+      // Step 4: Verify Query Store is enabled
+      const verifyQuery = `
+        SELECT
+          actual_state_desc AS ActualState,
+          current_storage_size_mb AS CurrentStorageMB,
+          max_storage_size_mb AS MaxStorageMB,
+          query_capture_mode_desc AS CaptureMode
+        FROM sys.database_query_store_options
+        WHERE database_id = DB_ID(@database)
+      `;
+
+      const verifyResult = await connectionManager.executeQuery(verifyQuery, { database });
+      const qsStatus = verifyResult.recordset[0];
 
       return {
         content: [{
           type: 'text' as const,
-          text: `✅ Query Store enabled for database '${database}'.\n\n` +
-                `Configuration:\n` +
+          text: `Query Store successfully enabled for database '${database}'.\n\n` +
+                `SQL Server Information:\n` +
+                `- Version: ${serverInfo.ProductVersion} (${serverInfo.ProductLevel})\n` +
+                `- Edition: ${edition}\n` +
+                `- Major Version: ${majorVersion} (${majorVersion >= 14 ? 'Full feature support' : 'Basic support'})\n\n` +
+                `Query Store Configuration:\n` +
+                `- Actual State: ${qsStatus?.ActualState || 'READ_WRITE'}\n` +
                 `- Max Storage: ${maxStorageSizeMB} MB\n` +
                 `- Capture Mode: ${queryCaptureMode}\n` +
-                `- Cleanup Mode: ${cleanupMode}\n\n` +
-                `Query Store will now begin capturing query performance data.`,
+                `- Cleanup Mode: ${cleanupMode}\n` +
+                `- Max Plans Per Query: ${maxPlansPerQuery}\n` +
+                (supportsWaitStats ? `- Wait Stats Capture: ${waitStatsCaptureMode}\n` : `- Wait Stats Capture: Not available (requires SQL Server 2017+)\n`) +
+                `\nQuery Store will now begin capturing query performance data.\n` +
+                `Use sqlserver_get_query_store_top_queries to view captured query statistics.`,
         }],
       };
     } catch (error) {
